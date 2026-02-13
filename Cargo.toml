@@ -12,7 +12,7 @@ name = "moq-client"
 path = "src/bin/moq-client.rs"
 
 [dependencies]
-wtransport = "0.7"
+wtransport = { version = "0.7", features = ["dangerous-configuration"] }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 anyhow = "1"
