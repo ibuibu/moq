@@ -24,7 +24,17 @@ const BROADCAST_CAPACITY: usize = 512;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let identity = Identity::self_signed(["localhost", "127.0.0.1", "::1"])?;
+    // WSL2 などで外部からアクセスする場合のホストIP を検出
+    let host_ip = detect_host_ip();
+    let san_names: Vec<String> = {
+        let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
+        if host_ip != "127.0.0.1" {
+            names.push(host_ip.clone());
+        }
+        names
+    };
+
+    let identity = Identity::self_signed(san_names.iter().map(|s| s.as_str()))?;
 
     // 証明書の SHA-256 ハッシュを取得
     let cert_hash: [u8; 32] = *identity
@@ -38,7 +48,7 @@ async fn main() -> Result<()> {
     );
 
     // HTTP サーバー (ビューアー HTML 配信)
-    let html = generate_viewer_html(&cert_hash);
+    let html = generate_viewer_html(&cert_hash, &host_ip);
     tokio::spawn(async move {
         if let Err(e) = run_http_server(html).await {
             tracing::error!("HTTP server error: {e}");
@@ -54,6 +64,7 @@ async fn main() -> Result<()> {
     let tracks: TrackChannels = Arc::new(Mutex::new(HashMap::new()));
 
     tracing::info!("MoQ server listening on :4433");
+    tracing::info!("WebTransport host: {host_ip}");
     tracing::info!("Open http://localhost:8080 in Chrome to view the stream");
 
     loop {
@@ -92,13 +103,27 @@ async fn run_http_server(html: String) -> Result<()> {
     }
 }
 
-fn generate_viewer_html(cert_hash: &[u8; 32]) -> String {
+/// デフォルト経路のローカル IP を取得（WSL2 環境で実 IP を検出）
+fn detect_host_ip() -> String {
+    // UDP ソケットを "接続" すると OS がルーティングを解決してくれる（実際には何も送らない）
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                return addr.ip().to_string();
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
+fn generate_viewer_html(cert_hash: &[u8; 32], host_ip: &str) -> String {
     let hash_array = cert_hash
         .iter()
         .map(|b| format!("0x{b:02x}"))
         .collect::<Vec<_>>()
         .join(", ");
 
+    let host = host_ip;
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -316,7 +341,7 @@ async function readMessage(reader, existingBuf) {{
 async function start() {{
   try {{
     setStatus('Connecting to WebTransport...');
-    const transport = new WebTransport('https://localhost:4433', {{
+    const transport = new WebTransport('https://{host}:4433', {{
       serverCertificateHashes: [{{
         algorithm: 'sha-256',
         value: CERT_HASH.buffer,
