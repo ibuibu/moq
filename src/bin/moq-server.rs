@@ -177,7 +177,7 @@ fn generate_viewer_html(cert_hash: &[u8; 32], host_ip: &str) -> String {
 <h1>MoQ Video Viewer</h1>
 <div id="status">Connecting...</div>
 <div id="stats"></div>
-<img id="frame" alt="video frame">
+<canvas id="frame" width="640" height="480"></canvas>
 
 <script>
 const CERT_HASH = new Uint8Array([{hash_array}]);
@@ -314,11 +314,12 @@ function decodeObjectHeader(buf) {{
 // --- Main ---
 const statusEl = document.getElementById('status');
 const statsEl = document.getElementById('stats');
-const frameEl = document.getElementById('frame');
 
 let frameCount = 0;
 let fpsStartTime = performance.now();
-let prevUrl = null;
+let decoder = null;
+let receivedKeyFrame = false;
+const GOP_SIZE = 30;
 
 function setStatus(text, cls) {{
   statusEl.textContent = text;
@@ -401,6 +402,24 @@ async function start() {{
     console.log('SubscribeOk received for ' + result.msg.namespace + '/' + result.msg.name);
     setStatus('Receiving video...', 'connected');
 
+    // H.264 VideoDecoder 初期化
+    const frameCanvas = document.getElementById('frame');
+    const frameCtx = frameCanvas.getContext('2d');
+    decoder = new VideoDecoder({{
+      output: (frame) => {{
+        frameCtx.drawImage(frame, 0, 0);
+        frame.close();
+      }},
+      error: (e) => {{
+        console.error('decoder error:', e);
+        setStatus('Decoder error: ' + e.message, 'error');
+      }}
+    }});
+    decoder.configure({{
+      codec: 'avc1.42001f',
+    }});
+    receivedKeyFrame = false;
+
     // オブジェクト受信ループ (unidirectional streams)
     const incomingReader = transport.incomingUnidirectionalStreams.getReader();
     while (true) {{
@@ -425,18 +444,30 @@ async function handleObjectStream(stream) {{
   const header = decodeObjectHeader(data);
   const payload = data.slice(header.headerSize, header.headerSize + header.payloadLength);
 
-  // JPEG → img 表示
-  const blob = new Blob([payload], {{ type: 'image/jpeg' }});
-  const url = URL.createObjectURL(blob);
-  if (prevUrl) URL.revokeObjectURL(prevUrl);
-  prevUrl = url;
-  frameEl.src = url;
+  const isKey = header.objectId === 0;
+  if (!receivedKeyFrame) {{
+    if (!isKey) {{
+      console.log('skipping delta frame (waiting for key frame)');
+      return;
+    }}
+    receivedKeyFrame = true;
+  }}
+
+  // H.264 デコード
+  const type = isKey ? 'key' : 'delta';
+  const timestamp = (header.groupId * GOP_SIZE + header.objectId) * Math.floor(1_000_000 / 15);
+  const chunk = new EncodedVideoChunk({{
+    type,
+    timestamp,
+    data: payload,
+  }});
+  decoder.decode(chunk);
 
   // Stats 更新
   frameCount++;
   const elapsed = (performance.now() - fpsStartTime) / 1000;
   const fps = elapsed > 0 ? (frameCount / elapsed).toFixed(1) : '0';
-  statsEl.textContent = `Frames: ${{frameCount}} | FPS: ${{fps}} | Size: ${{payload.length}} bytes`;
+  statsEl.textContent = `Frames: ${{frameCount}} | FPS: ${{fps}} | Size: ${{payload.length}} bytes | ${{type}}`;
 
   // 5秒ごとにFPSカウンタリセット
   if (elapsed > 5) {{
@@ -782,9 +813,13 @@ const ctx = canvas.getContext('2d');
 let transport = null;
 let publishing = false;
 let intervalId = null;
-let objectId = 0;
+let encoder = null;
+let groupId = -1;
+let objectIdInGroup = 0;
+let totalFramesSent = 0;
 let frameCount = 0;
 let fpsStartTime = 0;
+const KEY_FRAME_INTERVAL = 30; // 15fps * 2sec
 
 function setStatus(text, cls) {{
   statusEl.textContent = text;
@@ -881,8 +916,58 @@ async function startPublishing() {{
     }}
     console.log('PublishOk received for ' + result.msg.namespace + '/' + result.msg.name);
 
+    // H.264 VideoEncoder 初期化
+    encoder = new VideoEncoder({{
+      output: async (chunk, metadata) => {{
+        try {{
+          const buf = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(buf);
+          const isKey = chunk.type === 'key';
+          if (isKey) {{
+            groupId++;
+            objectIdInGroup = 0;
+          }}
+          const header = encodeObjectHeader('live', 'video', groupId, objectIdInGroup, buf.length);
+          objectIdInGroup++;
+
+          const uni = await transport.createUnidirectionalStream();
+          const w = uni.getWriter();
+          await w.write(concatBytes([header, buf]));
+          await w.close();
+
+          frameCount++;
+          const elapsed = (performance.now() - fpsStartTime) / 1000;
+          const fps = elapsed > 0 ? (frameCount / elapsed).toFixed(1) : '0';
+          statsEl.textContent = `Frames: ${{frameCount}} | FPS: ${{fps}} | Size: ${{buf.length}} bytes | ${{isKey ? 'KEY' : 'delta'}}`;
+          if (elapsed > 5) {{
+            frameCount = 0;
+            fpsStartTime = performance.now();
+          }}
+        }} catch (e) {{
+          console.error('send error:', e);
+          stopPublishing();
+          setStatus('Send error: ' + e.message, 'error');
+        }}
+      }},
+      error: (e) => {{
+        console.error('encoder error:', e);
+        stopPublishing();
+        setStatus('Encoder error: ' + e.message, 'error');
+      }}
+    }});
+    encoder.configure({{
+      codec: 'avc1.42001f',
+      width: 640,
+      height: 480,
+      bitrate: 1_000_000,
+      framerate: 15,
+      avc: {{ format: 'annexb' }},
+    }});
+
     publishing = true;
-    objectId = 0;
+    totalFramesSent = 0;
+    groupId = -1;
+    objectIdInGroup = 0;
     frameCount = 0;
     fpsStartTime = performance.now();
     stopBtn.disabled = false;
@@ -898,40 +983,19 @@ async function startPublishing() {{
 }}
 
 function sendFrame() {{
-  if (!publishing || !transport) return;
+  if (!publishing || !transport || !encoder) return;
 
   if (useTestPattern) {{
     drawTestPattern();
   }} else {{
     ctx.drawImage(preview, 0, 0, canvas.width, canvas.height);
   }}
-  canvas.toBlob(async (blob) => {{
-    if (!blob || !publishing) return;
-    try {{
-      const payload = new Uint8Array(await blob.arrayBuffer());
-      const header = encodeObjectHeader('live', 'video', 0, objectId, payload.length);
-      objectId++;
 
-      const uni = await transport.createUnidirectionalStream();
-      const writer = uni.getWriter();
-      await writer.write(concatBytes([header, payload]));
-      await writer.close();
-
-      frameCount++;
-      const elapsed = (performance.now() - fpsStartTime) / 1000;
-      const fps = elapsed > 0 ? (frameCount / elapsed).toFixed(1) : '0';
-      statsEl.textContent = `Frames: ${{frameCount}} | FPS: ${{fps}} | Size: ${{payload.length}} bytes`;
-
-      if (elapsed > 5) {{
-        frameCount = 0;
-        fpsStartTime = performance.now();
-      }}
-    }} catch (e) {{
-      console.error('send error:', e);
-      stopPublishing();
-      setStatus('Send error: ' + e.message, 'error');
-    }}
-  }}, 'image/jpeg', 0.8);
+  const frame = new VideoFrame(canvas, {{ timestamp: totalFramesSent * Math.floor(1_000_000 / 15) }});
+  const keyFrame = totalFramesSent % KEY_FRAME_INTERVAL === 0;
+  encoder.encode(frame, {{ keyFrame }});
+  frame.close();
+  totalFramesSent++;
 }}
 
 function stopPublishing() {{
@@ -940,6 +1004,10 @@ function stopPublishing() {{
     clearInterval(intervalId);
     intervalId = null;
   }}
+  if (encoder && encoder.state !== 'closed') {{
+    encoder.close();
+  }}
+  encoder = null;
   if (transport) {{
     transport.close();
     transport = null;
