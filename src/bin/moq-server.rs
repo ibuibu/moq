@@ -16,7 +16,7 @@ use moq::session::{recv_message, send_message, server_setup};
 type TrackKey = (String, String); // (namespace, name)
 type TrackChannels = Arc<Mutex<HashMap<TrackKey, broadcast::Sender<(ObjectHeader, Vec<u8>)>>>>;
 
-const BROADCAST_CAPACITY: usize = 256;
+const BROADCAST_CAPACITY: usize = 512;
 
 #[tokio::main]
 async fn main() -> Result<()> {
