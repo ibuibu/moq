@@ -51,7 +51,7 @@ pub async fn client_setup(connection: &Connection) -> Result<(wtransport::stream
     let resp = recv_message(&mut recv).await?;
     match resp {
         Message::ServerSetup(ss) => {
-            tracing::info!("received ServerSetup: version=0x{:x}", ss.selected_version);
+            tracing::info!("received ServerSetup: params={:?}", ss.params);
         }
         other => anyhow::bail!("expected ServerSetup, got {:?}", other),
     }
@@ -66,14 +66,10 @@ pub async fn server_setup(connection: &Connection) -> Result<(wtransport::stream
     let msg = recv_message(&mut recv).await?;
     match msg {
         Message::ClientSetup(cs) => {
-            tracing::info!("received ClientSetup: versions={:?}", cs.supported_versions);
-            // 簡易バージョンネゴシエーション: 最初のバージョンを選択
-            let selected = cs.supported_versions.first().copied().unwrap_or(0);
-            let resp = Message::ServerSetup(ServerSetup {
-                selected_version: selected,
-            });
+            tracing::info!("received ClientSetup: params={:?}", cs.params);
+            let resp = Message::ServerSetup(ServerSetup::default());
             send_message(&mut send, &resp).await?;
-            tracing::info!("sent ServerSetup: version=0x{selected:x}");
+            tracing::info!("sent ServerSetup");
         }
         other => anyhow::bail!("expected ClientSetup, got {:?}", other),
     }

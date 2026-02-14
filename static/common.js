@@ -64,13 +64,20 @@ function concatBytes(arrays) {
   return result;
 }
 
+// --- Uint16 encode ---
+function encodeUint16(value) {
+  const buf = new Uint8Array(2);
+  new DataView(buf.buffer).setUint16(0, value);
+  return buf;
+}
+
 // --- MoQ Messages ---
 function encodeClientSetup() {
-  const msgType = encodeVarInt(0x40); // CLIENT_SETUP
-  const numVersions = encodeVarInt(1);
-  const version = encodeVarInt(0xff000001); // draft version
-  const numParams = encodeVarInt(0);
-  return concatBytes([msgType, numVersions, version, numParams]);
+  const msgType = encodeVarInt(0x20); // CLIENT_SETUP (draft-15)
+  // Payload: num_params(varint=0)
+  const payload = encodeVarInt(0);
+  const length = encodeUint16(payload.length);
+  return concatBytes([msgType, length, payload]);
 }
 
 // decodeMessage は各ページ側で定義（viewer/publisher で異なるメッセージを扱う）

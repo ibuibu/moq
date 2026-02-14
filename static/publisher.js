@@ -1,9 +1,11 @@
 // --- Publisher-specific MoQ Messages ---
 function encodePublish(namespace, name) {
-  const msgType = encodeVarInt(0x06); // PUBLISH
+  const msgType = encodeVarInt(0x1D); // PUBLISH (draft-15)
   const ns = encodeString(namespace);
   const nm = encodeString(name);
-  return concatBytes([msgType, ns, nm]);
+  const payload = concatBytes([ns, nm]);
+  const length = encodeUint16(payload.length);
+  return concatBytes([msgType, length, payload]);
 }
 
 function encodeObjectHeader(namespace, name, groupId, objectId, payloadLength) {
@@ -20,26 +22,32 @@ function decodeMessage(buf) {
   const { value: msgType, bytesRead: b1 } = decodeVarInt(buf, offset);
   offset += b1;
 
-  if (msgType === 0x41) { // SERVER_SETUP
-    const { value: version, bytesRead: b2 } = decodeVarInt(buf, offset);
+  // Length framing: u16 big-endian
+  if (offset + 2 > buf.length) throw new Error('not enough data for message length');
+  const length = new DataView(buf.buffer, buf.byteOffset + offset).getUint16(0);
+  offset += 2;
+  if (offset + length > buf.length) throw new Error('not enough data for message payload');
+  const payloadStart = offset;
+
+  if (msgType === 0x21) { // SERVER_SETUP (draft-15)
+    const { value: numParams, bytesRead: b2 } = decodeVarInt(buf, offset);
     offset += b2;
-    const { value: numParams, bytesRead: b3 } = decodeVarInt(buf, offset);
-    offset += b3;
     for (let i = 0; i < numParams; i++) {
-      const { bytesRead: kb } = decodeVarInt(buf, offset);
+      const { value: key, bytesRead: kb } = decodeVarInt(buf, offset);
       offset += kb;
-      const { bytesRead: vb } = decodeString(buf, offset);
-      offset += vb;
+      const { value: valLen, bytesRead: vlb } = decodeVarInt(buf, offset);
+      offset += vlb;
+      offset += valLen; // skip value
     }
-    return { type: 'ServerSetup', version, totalBytes: offset };
+    return { type: 'ServerSetup', totalBytes: payloadStart + length };
   }
 
-  if (msgType === 0x07) { // PUBLISH_OK
+  if (msgType === 0x1E) { // PUBLISH_OK (draft-15)
     const { value: ns, bytesRead: b2 } = decodeString(buf, offset);
     offset += b2;
     const { value: name, bytesRead: b3 } = decodeString(buf, offset);
     offset += b3;
-    return { type: 'PublishOk', namespace: ns, name, totalBytes: offset };
+    return { type: 'PublishOk', namespace: ns, name, totalBytes: payloadStart + length };
   }
 
   throw new Error('unknown message type: 0x' + msgType.toString(16));
@@ -155,7 +163,7 @@ async function startPublishing() {
     if (serverSetup.type !== 'ServerSetup') {
       throw new Error('Expected ServerSetup, got ' + serverSetup.type);
     }
-    console.log('ServerSetup received, version=0x' + serverSetup.version.toString(16));
+    console.log('ServerSetup received');
 
     // Publish (video) 送信 → PublishOk 受信
     await writer.write(encodePublish('live', 'video'));
