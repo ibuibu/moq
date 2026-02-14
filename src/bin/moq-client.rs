@@ -1,3 +1,6 @@
+use std::io::Cursor;
+use std::time::Duration;
+
 use anyhow::Result;
 use wtransport::ClientConfig;
 use wtransport::Endpoint;
@@ -9,6 +12,10 @@ use moq::subscriber::Subscriber;
 const SERVER_URL: &str = "https://localhost:4433";
 const TRACK_NAMESPACE: &str = "live";
 const TRACK_NAME: &str = "chat";
+const VIDEO_TRACK_NAME: &str = "video";
+const VIDEO_WIDTH: u32 = 640;
+const VIDEO_HEIGHT: u32 = 480;
+const VIDEO_FPS: u64 = 15;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,8 +27,10 @@ async fn main() -> Result<()> {
     match mode {
         "publish" => run_publisher().await,
         "subscribe" => run_subscriber().await,
+        "video-publish" => run_video_publisher().await,
+        "video-subscribe" => run_video_subscriber().await,
         _ => {
-            println!("Usage: moq-client <publish|subscribe>");
+            println!("Usage: moq-client <publish|subscribe|video-publish|video-subscribe>");
             Ok(())
         }
     }
@@ -93,5 +102,143 @@ async fn run_subscriber() -> Result<()> {
             "[group={} id={}] {}",
             header.group_id, header.object_id, text
         );
+    }
+}
+
+async fn run_video_publisher() -> Result<()> {
+    use image::codecs::jpeg::JpegEncoder;
+    use nokhwa::pixel_format::RgbFormat;
+    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
+    use nokhwa::Camera;
+
+    let connection = connect().await?;
+    let (control_send, control_recv) = client_setup(&connection).await?;
+
+    let mut publisher = Publisher::new(
+        connection,
+        control_send,
+        control_recv,
+        TRACK_NAMESPACE.to_string(),
+        VIDEO_TRACK_NAME.to_string(),
+    )
+    .await?;
+
+    // カメラ初期化
+    let index = CameraIndex::Index(0);
+    let requested =
+        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+    let mut camera = Camera::new(index, requested)?;
+    camera.open_stream()?;
+    tracing::info!("camera opened, starting video capture");
+
+    let mut interval = tokio::time::interval(Duration::from_millis(1000 / VIDEO_FPS));
+
+    loop {
+        interval.tick().await;
+
+        let frame = match camera.frame() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("frame capture error: {e}");
+                continue;
+            }
+        };
+
+        let decoded = frame.decode_image::<RgbFormat>()?;
+
+        // JPEG エンコード
+        let mut jpeg_buf = Cursor::new(Vec::new());
+        let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, 80);
+        decoded.write_with_encoder(encoder)?;
+        let jpeg_data = jpeg_buf.into_inner();
+
+        publisher.send_object(&jpeg_data).await?;
+        tracing::debug!("sent video frame: {} bytes", jpeg_data.len());
+    }
+}
+
+async fn run_video_subscriber() -> Result<()> {
+    use sdl2::event::Event;
+    use sdl2::keyboard::Keycode;
+    use sdl2::pixels::PixelFormatEnum;
+
+    let connection = connect().await?;
+    let (control_send, control_recv) = client_setup(&connection).await?;
+
+    let subscriber = Subscriber::new(
+        connection,
+        control_send,
+        control_recv,
+        TRACK_NAMESPACE.to_string(),
+        VIDEO_TRACK_NAME.to_string(),
+    )
+    .await?;
+
+    tracing::info!("video subscriber ready. waiting for frames...");
+
+    // SDL2 初期化
+    let sdl_context = sdl2::init().map_err(|e| anyhow::anyhow!(e))?;
+    let video_subsystem = sdl_context.video().map_err(|e| anyhow::anyhow!(e))?;
+
+    let window = video_subsystem
+        .window("MoQ Video", VIDEO_WIDTH, VIDEO_HEIGHT)
+        .position_centered()
+        .build()?;
+
+    let mut canvas = window.into_canvas().build()?;
+    let texture_creator = canvas.texture_creator();
+    let mut texture = texture_creator.create_texture_streaming(
+        PixelFormatEnum::RGB24,
+        VIDEO_WIDTH,
+        VIDEO_HEIGHT,
+    )?;
+
+    let mut event_pump = sdl_context.event_pump().map_err(|e| anyhow::anyhow!(e))?;
+
+    loop {
+        // SDL2 イベント処理
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. }
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                } => {
+                    tracing::info!("quitting video subscriber");
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        // フレーム受信（ノンブロッキングでタイムアウト付き）
+        let recv_result = tokio::time::timeout(
+            Duration::from_millis(50),
+            subscriber.recv_object(),
+        )
+        .await;
+
+        if let Ok(Ok((_header, payload))) = recv_result {
+            // JPEG → RGB デコード
+            match image::load_from_memory_with_format(&payload, image::ImageFormat::Jpeg) {
+                Ok(img) => {
+                    let rgb = img
+                        .resize_exact(
+                            VIDEO_WIDTH,
+                            VIDEO_HEIGHT,
+                            image::imageops::FilterType::Nearest,
+                        )
+                        .to_rgb8();
+                    let pitch = VIDEO_WIDTH as usize * 3;
+                    texture.update(None, rgb.as_raw(), pitch)?;
+                    canvas.clear();
+                    canvas.copy(&texture, None, None).map_err(|e| anyhow::anyhow!(e))?;
+                    canvas.present();
+                }
+                Err(e) => {
+                    tracing::warn!("jpeg decode error: {e}");
+                }
+            }
+        }
     }
 }
