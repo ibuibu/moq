@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MoQ Video Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e; color: #eee; font-family: monospace;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 20px;
+  }
+  h1 { margin-bottom: 10px; color: #0ff; }
+  #status { margin-bottom: 10px; font-size: 14px; color: #aaa; }
+  #stats { margin-bottom: 10px; font-size: 13px; color: #888; }
+  #frame {
+    max-width: 90vw; max-height: 70vh;
+    border: 2px solid #333; background: #000;
+  }
+  button {
+    padding: 10px 30px; font-size: 16px; font-family: monospace;
+    background: #0ff; color: #1a1a2e; border: none; cursor: pointer;
+    margin: 10px;
+  }
+  button:disabled { background: #555; color: #888; cursor: not-allowed; }
+  .connected { color: #0f0 !important; }
+  .error { color: #f44 !important; }
+</style>
+</head>
+<body>
+<h1>MoQ Video Viewer</h1>
+<div id="status">Connecting...</div>
+<div id="stats"></div>
+<button id="unmuteBtn" style="display:none">Unmute Audio</button>
+<canvas id="frame" width="640" height="480"></canvas>
+
+<script>
+const CERT_HASH = new Uint8Array([__CERT_HASH__]);
+const HOST_IP = '__HOST_IP__';
+</script>
+<script src="/common.js"></script>
+<script src="/viewer.js"></script>
+</body>
+</html>
