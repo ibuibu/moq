@@ -107,9 +107,7 @@ async fn run_subscriber() -> Result<()> {
 
 async fn run_video_publisher() -> Result<()> {
     use image::codecs::jpeg::JpegEncoder;
-    use nokhwa::pixel_format::RgbFormat;
-    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
-    use nokhwa::Camera;
+    use image::RgbImage;
 
     let connection = connect().await?;
     let (control_send, control_recv) = client_setup(&connection).await?;
@@ -123,37 +121,52 @@ async fn run_video_publisher() -> Result<()> {
     )
     .await?;
 
-    // カメラ初期化
-    let index = CameraIndex::Index(0);
-    let requested =
-        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-    let mut camera = Camera::new(index, requested)?;
-    camera.open_stream()?;
-    tracing::info!("camera opened, starting video capture");
+    tracing::info!("starting test pattern video publisher ({}x{} @ {}fps)", VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS);
 
     let mut interval = tokio::time::interval(Duration::from_millis(1000 / VIDEO_FPS));
+    let mut frame_count: u64 = 0;
+
+    // カラーバーの色 (SMPTE風)
+    let colors: [(u8, u8, u8); 7] = [
+        (192, 192, 192), // 白
+        (192, 192, 0),   // 黄
+        (0, 192, 192),   // シアン
+        (0, 192, 0),     // 緑
+        (192, 0, 192),   // マゼンタ
+        (192, 0, 0),     // 赤
+        (0, 0, 192),     // 青
+    ];
 
     loop {
         interval.tick().await;
 
-        let frame = match camera.frame() {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!("frame capture error: {e}");
-                continue;
-            }
-        };
+        // テストパターン画像を生成
+        let mut img = RgbImage::new(VIDEO_WIDTH, VIDEO_HEIGHT);
+        let bar_width = VIDEO_WIDTH / 7;
 
-        let decoded = frame.decode_image::<RgbFormat>()?;
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            let bar_index = (x / bar_width).min(6) as usize;
+            let (r, g, b) = colors[bar_index];
+
+            // 下部にスクロールするバーを表示（動きがわかるように）
+            if y > VIDEO_HEIGHT * 3 / 4 {
+                let scroll = ((frame_count * 4 + x as u64) % VIDEO_WIDTH as u64) as u32;
+                let brightness = if scroll < VIDEO_WIDTH / 2 { 255u8 } else { 0u8 };
+                *pixel = image::Rgb([brightness, brightness, brightness]);
+            } else {
+                *pixel = image::Rgb([r, g, b]);
+            }
+        }
 
         // JPEG エンコード
         let mut jpeg_buf = Cursor::new(Vec::new());
         let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, 80);
-        decoded.write_with_encoder(encoder)?;
+        img.write_with_encoder(encoder)?;
         let jpeg_data = jpeg_buf.into_inner();
 
         publisher.send_object(&jpeg_data).await?;
-        tracing::debug!("sent video frame: {} bytes", jpeg_data.len());
+        tracing::debug!("sent frame #{}: {} bytes", frame_count, jpeg_data.len());
+        frame_count += 1;
     }
 }
 
