@@ -47,10 +47,11 @@ async fn main() -> Result<()> {
         cert_hash.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
     );
 
-    // HTTP サーバー (ビューアー HTML 配信)
-    let html = generate_viewer_html(&cert_hash, &host_ip);
+    // HTTP サーバー (ビューアー / パブリッシャー HTML 配信)
+    let viewer_html = generate_viewer_html(&cert_hash, &host_ip);
+    let publisher_html = generate_publisher_html(&cert_hash, &host_ip);
     tokio::spawn(async move {
-        if let Err(e) = run_http_server(html).await {
+        if let Err(e) = run_http_server(viewer_html, publisher_html).await {
             tracing::error!("HTTP server error: {e}");
         }
     });
@@ -65,7 +66,8 @@ async fn main() -> Result<()> {
 
     tracing::info!("MoQ server listening on :4433");
     tracing::info!("WebTransport host: {host_ip}");
-    tracing::info!("Open http://localhost:8080 in Chrome to view the stream");
+    tracing::info!("Viewer:    http://localhost:8080");
+    tracing::info!("Publisher: http://localhost:8080/publish");
 
     loop {
         let incoming = server.accept().await;
@@ -79,17 +81,34 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_http_server(html: String) -> Result<()> {
+async fn run_http_server(viewer_html: String, publisher_html: String) -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
     tracing::info!("HTTP server listening on http://localhost:8080");
 
     loop {
         let (mut stream, addr) = listener.accept().await?;
-        let html = html.clone();
+        let viewer_html = viewer_html.clone();
+        let publisher_html = publisher_html.clone();
         tokio::spawn(async move {
-            // リクエストを読み捨て
             let mut buf = [0u8; 4096];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let n = match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+
+            // リクエスト行からパスを取得 (e.g. "GET /publish HTTP/1.1")
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+
+            let html = if path == "/publish" {
+                &publisher_html
+            } else {
+                &viewer_html
+            };
 
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -557,4 +576,385 @@ async fn handle_session(
     }
 
     Ok(())
+}
+
+fn generate_publisher_html(cert_hash: &[u8; 32], host_ip: &str) -> String {
+    let hash_array = cert_hash
+        .iter()
+        .map(|b| format!("0x{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let host = host_ip;
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MoQ Video Publisher</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    background: #1a1a2e; color: #eee; font-family: monospace;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 20px;
+  }}
+  h1 {{ margin-bottom: 10px; color: #f0a; }}
+  #status {{ margin-bottom: 10px; font-size: 14px; color: #aaa; }}
+  #stats {{ margin-bottom: 10px; font-size: 13px; color: #888; }}
+  video {{
+    max-width: 90vw; max-height: 60vh;
+    border: 2px solid #333; background: #000;
+    margin-bottom: 10px;
+  }}
+  button {{
+    padding: 10px 30px; font-size: 16px; font-family: monospace;
+    background: #f0a; color: #1a1a2e; border: none; cursor: pointer;
+    margin: 5px;
+  }}
+  button:disabled {{ background: #555; color: #888; cursor: not-allowed; }}
+  .connected {{ color: #0f0 !important; }}
+  .error {{ color: #f44 !important; }}
+</style>
+</head>
+<body>
+<h1>MoQ Video Publisher</h1>
+<div id="status">Initializing...</div>
+<div id="stats"></div>
+<video id="preview" autoplay muted playsinline></video>
+<div>
+  <button id="startBtn" disabled>Start Publishing</button>
+  <button id="stopBtn" disabled>Stop</button>
+</div>
+<canvas id="canvas" style="display:none"></canvas>
+
+<script>
+const CERT_HASH = new Uint8Array([{hash_array}]);
+
+// --- VarInt (RFC 9000 Section 16) ---
+function encodeVarInt(value) {{
+  if (value < 0x40) {{
+    return new Uint8Array([value]);
+  }} else if (value < 0x4000) {{
+    const buf = new Uint8Array(2);
+    new DataView(buf.buffer).setUint16(0, 0x4000 | value);
+    return buf;
+  }} else if (value < 0x40000000) {{
+    const buf = new Uint8Array(4);
+    new DataView(buf.buffer).setUint32(0, 0x80000000 | value);
+    return buf;
+  }} else {{
+    const buf = new Uint8Array(8);
+    const dv = new DataView(buf.buffer);
+    const hi = Math.floor(value / 0x100000000);
+    const lo = value >>> 0;
+    dv.setUint32(0, 0xc0000000 | hi);
+    dv.setUint32(4, lo);
+    return buf;
+  }}
+}}
+
+function decodeVarInt(buf, offset) {{
+  const first = buf[offset];
+  const prefix = first >> 6;
+  const len = 1 << prefix;
+  if (offset + len > buf.length) throw new Error('not enough data for varint');
+  let val = first & 0x3f;
+  for (let i = 1; i < len; i++) {{
+    val = val * 256 + buf[offset + i];
+  }}
+  return {{ value: val, bytesRead: len }};
+}}
+
+// --- String encode/decode ---
+function encodeString(str) {{
+  const encoded = new TextEncoder().encode(str);
+  const lenBytes = encodeVarInt(encoded.length);
+  const result = new Uint8Array(lenBytes.length + encoded.length);
+  result.set(lenBytes);
+  result.set(encoded, lenBytes.length);
+  return result;
+}}
+
+function decodeString(buf, offset) {{
+  const {{ value: len, bytesRead }} = decodeVarInt(buf, offset);
+  offset += bytesRead;
+  if (offset + len > buf.length) throw new Error('not enough data for string');
+  const str = new TextDecoder().decode(buf.slice(offset, offset + len));
+  return {{ value: str, bytesRead: bytesRead + len }};
+}}
+
+function concatBytes(arrays) {{
+  const totalLen = arrays.reduce((sum, a) => sum + a.length, 0);
+  const result = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const a of arrays) {{
+    result.set(a, offset);
+    offset += a.length;
+  }}
+  return result;
+}}
+
+// --- MoQ Messages ---
+function encodeClientSetup() {{
+  const msgType = encodeVarInt(0x40); // CLIENT_SETUP
+  const numVersions = encodeVarInt(1);
+  const version = encodeVarInt(0xff000001);
+  const numParams = encodeVarInt(0);
+  return concatBytes([msgType, numVersions, version, numParams]);
+}}
+
+function encodePublish(namespace, name) {{
+  const msgType = encodeVarInt(0x06); // PUBLISH
+  const ns = encodeString(namespace);
+  const nm = encodeString(name);
+  return concatBytes([msgType, ns, nm]);
+}}
+
+function encodeObjectHeader(namespace, name, groupId, objectId, payloadLength) {{
+  const ns = encodeString(namespace);
+  const nm = encodeString(name);
+  const gid = encodeVarInt(groupId);
+  const oid = encodeVarInt(objectId);
+  const plen = encodeVarInt(payloadLength);
+  return concatBytes([ns, nm, gid, oid, plen]);
+}}
+
+// --- Decode messages from control stream ---
+function decodeMessage(buf) {{
+  let offset = 0;
+  const {{ value: msgType, bytesRead: b1 }} = decodeVarInt(buf, offset);
+  offset += b1;
+
+  if (msgType === 0x41) {{ // SERVER_SETUP
+    const {{ value: version, bytesRead: b2 }} = decodeVarInt(buf, offset);
+    offset += b2;
+    const {{ value: numParams, bytesRead: b3 }} = decodeVarInt(buf, offset);
+    offset += b3;
+    for (let i = 0; i < numParams; i++) {{
+      const {{ bytesRead: kb }} = decodeVarInt(buf, offset);
+      offset += kb;
+      const {{ bytesRead: vb }} = decodeString(buf, offset);
+      offset += vb;
+    }}
+    return {{ type: 'ServerSetup', version, totalBytes: offset }};
+  }}
+
+  if (msgType === 0x07) {{ // PUBLISH_OK
+    const {{ value: ns, bytesRead: b2 }} = decodeString(buf, offset);
+    offset += b2;
+    const {{ value: name, bytesRead: b3 }} = decodeString(buf, offset);
+    offset += b3;
+    return {{ type: 'PublishOk', namespace: ns, name, totalBytes: offset }};
+  }}
+
+  throw new Error('unknown message type: 0x' + msgType.toString(16));
+}}
+
+async function readMessage(reader, existingBuf) {{
+  let buf = existingBuf || new Uint8Array(0);
+  while (true) {{
+    try {{
+      const msg = decodeMessage(buf);
+      const remaining = buf.slice(msg.totalBytes);
+      return {{ msg, remaining }};
+    }} catch (e) {{
+      // need more data
+    }}
+    const {{ done, value }} = await reader.read();
+    if (done) throw new Error('stream closed while reading message');
+    const newBuf = new Uint8Array(buf.length + value.length);
+    newBuf.set(buf);
+    newBuf.set(value, buf.length);
+    buf = newBuf;
+  }}
+}}
+
+// --- Main ---
+const statusEl = document.getElementById('status');
+const statsEl = document.getElementById('stats');
+const preview = document.getElementById('preview');
+const canvas = document.getElementById('canvas');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const ctx = canvas.getContext('2d');
+
+let transport = null;
+let publishing = false;
+let intervalId = null;
+let objectId = 0;
+let frameCount = 0;
+let fpsStartTime = 0;
+
+function setStatus(text, cls) {{
+  statusEl.textContent = text;
+  statusEl.className = cls || '';
+}}
+
+let useTestPattern = false;
+let testPatternFrame = 0;
+
+function drawTestPattern() {{
+  testPatternFrame++;
+  const w = canvas.width, h = canvas.height;
+  // 背景グラデーション
+  const grad = ctx.createLinearGradient(0, 0, w, h);
+  grad.addColorStop(0, '#1a1a2e');
+  grad.addColorStop(1, '#16213e');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, w, h);
+  // カラーバー
+  const colors = ['#ff0000','#00ff00','#0000ff','#ffff00','#ff00ff','#00ffff','#ffffff'];
+  const barW = w / colors.length;
+  for (let i = 0; i < colors.length; i++) {{
+    ctx.fillStyle = colors[i];
+    ctx.fillRect(i * barW, h * 0.1, barW, h * 0.3);
+  }}
+  // 動くボックス
+  const boxX = (testPatternFrame * 3) % w;
+  ctx.fillStyle = '#f0a';
+  ctx.fillRect(boxX, h * 0.55, 60, 60);
+  // テキスト
+  ctx.fillStyle = '#fff';
+  ctx.font = '24px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('MoQ Test Pattern', w / 2, h * 0.88);
+  ctx.font = '16px monospace';
+  ctx.fillText('Frame: ' + testPatternFrame, w / 2, h * 0.95);
+}}
+
+// カメラ取得（失敗時はテストパターンにフォールバック）
+async function initCamera() {{
+  canvas.width = 640;
+  canvas.height = 480;
+  try {{
+    const stream = await navigator.mediaDevices.getUserMedia({{
+      video: {{ width: 640, height: 480 }}
+    }});
+    preview.srcObject = stream;
+    setStatus('Camera ready. Click "Start Publishing".', '');
+  }} catch (e) {{
+    console.warn('Camera unavailable, using test pattern:', e.message);
+    useTestPattern = true;
+    preview.style.display = 'none';
+    canvas.style.display = 'block';
+    canvas.style.maxWidth = '90vw';
+    canvas.style.maxHeight = '60vh';
+    canvas.style.border = '2px solid #333';
+    drawTestPattern();
+    setStatus('No camera - using test pattern. Click "Start Publishing".', '');
+  }}
+  startBtn.disabled = false;
+}}
+
+async function startPublishing() {{
+  startBtn.disabled = true;
+  try {{
+    setStatus('Connecting to WebTransport...');
+    transport = new WebTransport('https://{host}:4433', {{
+      serverCertificateHashes: [{{
+        algorithm: 'sha-256',
+        value: CERT_HASH.buffer,
+      }}],
+    }});
+    await transport.ready;
+    setStatus('Connected! Setting up...', 'connected');
+
+    // 制御ストリーム (bidirectional)
+    const bidi = await transport.createBidirectionalStream();
+    const writer = bidi.writable.getWriter();
+    const reader = bidi.readable.getReader();
+
+    // ClientSetup 送信 → ServerSetup 受信
+    await writer.write(encodeClientSetup());
+    let {{ msg: serverSetup, remaining }} = await readMessage(reader);
+    if (serverSetup.type !== 'ServerSetup') {{
+      throw new Error('Expected ServerSetup, got ' + serverSetup.type);
+    }}
+    console.log('ServerSetup received, version=0x' + serverSetup.version.toString(16));
+
+    // Publish 送信 → PublishOk 受信
+    await writer.write(encodePublish('live', 'video'));
+    let result = await readMessage(reader, remaining);
+    if (result.msg.type !== 'PublishOk') {{
+      throw new Error('Expected PublishOk, got ' + result.msg.type);
+    }}
+    console.log('PublishOk received for ' + result.msg.namespace + '/' + result.msg.name);
+
+    publishing = true;
+    objectId = 0;
+    frameCount = 0;
+    fpsStartTime = performance.now();
+    stopBtn.disabled = false;
+    setStatus('Publishing...', 'connected');
+
+    // フレーム送信ループ (15 FPS)
+    intervalId = setInterval(() => sendFrame(), 67);
+  }} catch (e) {{
+    console.error(e);
+    setStatus('Error: ' + e.message, 'error');
+    startBtn.disabled = false;
+  }}
+}}
+
+function sendFrame() {{
+  if (!publishing || !transport) return;
+
+  if (useTestPattern) {{
+    drawTestPattern();
+  }} else {{
+    ctx.drawImage(preview, 0, 0, canvas.width, canvas.height);
+  }}
+  canvas.toBlob(async (blob) => {{
+    if (!blob || !publishing) return;
+    try {{
+      const payload = new Uint8Array(await blob.arrayBuffer());
+      const header = encodeObjectHeader('live', 'video', 0, objectId, payload.length);
+      objectId++;
+
+      const uni = await transport.createUnidirectionalStream();
+      const writer = uni.getWriter();
+      await writer.write(concatBytes([header, payload]));
+      await writer.close();
+
+      frameCount++;
+      const elapsed = (performance.now() - fpsStartTime) / 1000;
+      const fps = elapsed > 0 ? (frameCount / elapsed).toFixed(1) : '0';
+      statsEl.textContent = `Frames: ${{frameCount}} | FPS: ${{fps}} | Size: ${{payload.length}} bytes`;
+
+      if (elapsed > 5) {{
+        frameCount = 0;
+        fpsStartTime = performance.now();
+      }}
+    }} catch (e) {{
+      console.error('send error:', e);
+      stopPublishing();
+      setStatus('Send error: ' + e.message, 'error');
+    }}
+  }}, 'image/jpeg', 0.8);
+}}
+
+function stopPublishing() {{
+  publishing = false;
+  if (intervalId) {{
+    clearInterval(intervalId);
+    intervalId = null;
+  }}
+  if (transport) {{
+    transport.close();
+    transport = null;
+  }}
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  setStatus('Stopped.', '');
+}}
+
+startBtn.addEventListener('click', startPublishing);
+stopBtn.addEventListener('click', stopPublishing);
+
+initCamera();
+</script>
+</body>
+</html>"#
+    )
 }
