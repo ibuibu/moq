@@ -104,8 +104,14 @@ async fn run_http_server(html: String) -> Result<()> {
 }
 
 /// デフォルト経路のローカル IP を取得（WSL2 環境で実 IP を検出）
+///
+/// WSL2 (NAT モード) では `localhost` 経由の UDP 転送が機能しないため、
+/// WebTransport (QUIC/UDP) の接続先には WSL2 の実 IP が必要になる。
+///
+/// UDP ソケットに対して `connect()` を呼ぶと、実際にはパケットを送信せずに
+/// OS のルーティングテーブルを参照して送信元 IP を決定する。
+/// その後 `local_addr()` で取得できるアドレスがデフォルト経路のローカル IP になる。
 fn detect_host_ip() -> String {
-    // UDP ソケットを "接続" すると OS がルーティングを解決してくれる（実際には何も送らない）
     if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
         if socket.connect("8.8.8.8:80").is_ok() {
             if let Ok(addr) = socket.local_addr() {
