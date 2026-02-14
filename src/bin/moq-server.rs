@@ -169,6 +169,12 @@ fn generate_viewer_html(cert_hash: &[u8; 32], host_ip: &str) -> String {
     max-width: 90vw; max-height: 70vh;
     border: 2px solid #333; background: #000;
   }}
+  button {{
+    padding: 10px 30px; font-size: 16px; font-family: monospace;
+    background: #0ff; color: #1a1a2e; border: none; cursor: pointer;
+    margin: 10px;
+  }}
+  button:disabled {{ background: #555; color: #888; cursor: not-allowed; }}
   .connected {{ color: #0f0 !important; }}
   .error {{ color: #f44 !important; }}
 </style>
@@ -177,6 +183,7 @@ fn generate_viewer_html(cert_hash: &[u8; 32], host_ip: &str) -> String {
 <h1>MoQ Video Viewer</h1>
 <div id="status">Connecting...</div>
 <div id="stats"></div>
+<button id="unmuteBtn" style="display:none">Unmute Audio</button>
 <canvas id="frame" width="640" height="480"></canvas>
 
 <script>
@@ -321,6 +328,10 @@ let decoder = null;
 let receivedKeyFrame = false;
 const GOP_SIZE = 30;
 
+let audioDecoder = null;
+let audioContext = null;
+let nextAudioTime = 0;
+
 function setStatus(text, cls) {{
   statusEl.textContent = text;
   statusEl.className = cls || '';
@@ -391,16 +402,22 @@ async function start() {{
     }}
     console.log('ServerSetup received, version=0x' + serverSetup.version.toString(16));
 
-    // Subscribe 送信
+    // Subscribe (video) 送信 → SubscribeOk 受信
     await writer.write(encodeSubscribe('live', 'video'));
-
-    // SubscribeOk 受信
     let result = await readMessage(reader, remaining);
     if (result.msg.type !== 'SubscribeOk') {{
       throw new Error('Expected SubscribeOk, got ' + result.msg.type);
     }}
     console.log('SubscribeOk received for ' + result.msg.namespace + '/' + result.msg.name);
-    setStatus('Receiving video...', 'connected');
+
+    // Subscribe (audio) 送信 → SubscribeOk 受信
+    await writer.write(encodeSubscribe('live', 'audio'));
+    let audioResult = await readMessage(reader, result.remaining);
+    if (audioResult.msg.type !== 'SubscribeOk') {{
+      throw new Error('Expected SubscribeOk for audio, got ' + audioResult.msg.type);
+    }}
+    console.log('SubscribeOk received for ' + audioResult.msg.namespace + '/' + audioResult.msg.name);
+    setStatus('Receiving video + audio...', 'connected');
 
     // H.264 VideoDecoder 初期化
     const frameCanvas = document.getElementById('frame');
@@ -419,6 +436,58 @@ async function start() {{
       codec: 'avc1.42001f',
     }});
     receivedKeyFrame = false;
+
+    // AudioDecoder + AudioContext 初期化
+    audioContext = new AudioContext({{ sampleRate: 48000 }});
+    nextAudioTime = 0;
+
+    // autoplay policy 対策: ボタンクリックで AudioContext を resume
+    const unmuteBtn = document.getElementById('unmuteBtn');
+    if (audioContext.state === 'suspended') {{
+      unmuteBtn.style.display = 'inline-block';
+      unmuteBtn.addEventListener('click', () => {{
+        audioContext.resume();
+        unmuteBtn.style.display = 'none';
+      }});
+    }}
+    // ページ上の任意のクリックでも resume
+    document.addEventListener('click', () => {{
+      if (audioContext && audioContext.state === 'suspended') {{
+        audioContext.resume();
+        unmuteBtn.style.display = 'none';
+      }}
+    }}, {{ once: true }});
+
+    audioDecoder = new AudioDecoder({{
+      output: (audioData) => {{
+        // AudioData → AudioBuffer → AudioBufferSourceNode でギャップレス再生
+        const numFrames = audioData.numberOfFrames;
+        const sampleRate = audioData.sampleRate;
+        const buffer = audioContext.createBuffer(1, numFrames, sampleRate);
+        const channelData = new Float32Array(numFrames);
+        audioData.copyTo(channelData, {{ planeIndex: 0, format: 'f32-planar' }});
+        buffer.copyToChannel(channelData, 0);
+        audioData.close();
+
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioContext.destination);
+        const currentTime = audioContext.currentTime;
+        if (nextAudioTime < currentTime) {{
+          nextAudioTime = currentTime;
+        }}
+        source.start(nextAudioTime);
+        nextAudioTime += numFrames / sampleRate;
+      }},
+      error: (e) => {{
+        console.error('audio decoder error:', e);
+      }}
+    }});
+    audioDecoder.configure({{
+      codec: 'opus',
+      sampleRate: 48000,
+      numberOfChannels: 1,
+    }});
 
     // オブジェクト受信ループ (unidirectional streams)
     const incomingReader = transport.incomingUnidirectionalStreams.getReader();
@@ -444,6 +513,18 @@ async function handleObjectStream(stream) {{
   const header = decodeObjectHeader(data);
   const payload = data.slice(header.headerSize, header.headerSize + header.payloadLength);
 
+  if (header.name === 'audio') {{
+    // Opus 音声デコード (全フレーム key)
+    const chunk = new EncodedAudioChunk({{
+      type: 'key',
+      timestamp: header.objectId * 20_000, // 20ms per frame
+      data: payload,
+    }});
+    audioDecoder.decode(chunk);
+    return;
+  }}
+
+  // video トラック
   const isKey = header.objectId === 0;
   if (!receivedKeyFrame) {{
     if (!isKey) {{
@@ -483,6 +564,40 @@ start();
     )
 }
 
+async fn forward_track(
+    connection: wtransport::Connection,
+    mut rx: broadcast::Receiver<(ObjectHeader, Vec<u8>)>,
+) {
+    loop {
+        let (header, payload) = match rx.recv().await {
+            Ok(v) => v,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("subscriber lagged, skipped {n} messages");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        };
+
+        let mut send = match connection.open_uni().await {
+            Ok(opening) => match opening.await {
+                Ok(s) => s,
+                Err(_) => break,
+            },
+            Err(_) => break,
+        };
+
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        if send.write_all(&buf).await.is_err() {
+            break;
+        }
+        if send.write_all(&payload).await.is_err() {
+            break;
+        }
+        let _ = send.finish().await;
+    }
+}
+
 async fn handle_session(
     incoming: wtransport::endpoint::IncomingSession,
     tracks: TrackChannels,
@@ -499,23 +614,50 @@ async fn handle_session(
         Message::Publish(p) => {
             tracing::info!("publisher for {}/{}", p.track_namespace, p.track_name);
 
-            // PublishOk を返す
+            // 最初の PublishOk を返す
             let ok = Message::PublishOk(PublishOk {
                 track_namespace: p.track_namespace.clone(),
                 track_name: p.track_name.clone(),
             });
             send_message(&mut control_send, &ok).await?;
 
-            // broadcast チャネルを取得 or 作成
-            let key = (p.track_namespace.clone(), p.track_name.clone());
-            let tx = {
+            // 最初のトラックの broadcast チャネルを作成
+            {
                 let mut map = tracks.lock().await;
+                let key = (p.track_namespace.clone(), p.track_name.clone());
                 map.entry(key)
-                    .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
-                    .clone()
-            };
+                    .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0);
+            }
+
+            // 制御ストリームをバックグラウンドで読み続け、追加 Publish に対応
+            let tracks_ctrl = tracks.clone();
+            tokio::spawn(async move {
+                loop {
+                    match recv_message(&mut control_recv).await {
+                        Ok(Message::Publish(p2)) => {
+                            tracing::info!("additional publish for {}/{}", p2.track_namespace, p2.track_name);
+                            let ok = Message::PublishOk(PublishOk {
+                                track_namespace: p2.track_namespace.clone(),
+                                track_name: p2.track_name.clone(),
+                            });
+                            if send_message(&mut control_send, &ok).await.is_err() {
+                                break;
+                            }
+                            let key = (p2.track_namespace.clone(), p2.track_name.clone());
+                            let mut map = tracks_ctrl.lock().await;
+                            map.entry(key)
+                                .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0);
+                        }
+                        Ok(other) => {
+                            tracing::warn!("unexpected message from publisher: {:?}", other);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
 
             // Publisher からの unidirectional stream を受け取って broadcast
+            // ObjectHeader の namespace/name で適切なチャネルにルーティング
             loop {
                 let mut recv = match connection.accept_uni().await {
                     Ok(r) => r,
@@ -544,7 +686,14 @@ async fn handle_session(
                     payload.len()
                 );
 
-                // 受信者がいなくてもエラーにはしない
+                // ObjectHeader の namespace/name に対応するチャネルに送信
+                let key = (header.track_namespace.clone(), header.track_name.clone());
+                let tx = {
+                    let mut map = tracks.lock().await;
+                    map.entry(key)
+                        .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
+                        .clone()
+                };
                 let _ = tx.send((header, payload));
             }
         }
@@ -559,45 +708,48 @@ async fn handle_session(
             });
             send_message(&mut control_send, &ok).await?;
 
-            // broadcast チャネルを購読
-            let key = (s.track_namespace.clone(), s.track_name.clone());
-            let mut rx = {
+            // 最初のトラック転送を spawn
+            let rx = {
                 let mut map = tracks.lock().await;
+                let key = (s.track_namespace.clone(), s.track_name.clone());
                 let tx = map
                     .entry(key)
                     .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
                     .clone();
                 tx.subscribe()
             };
+            let conn = connection.clone();
+            tokio::spawn(forward_track(conn, rx));
 
-            // Object を subscriber に中継 (unidirectional stream で送る)
+            // 制御ストリームを読み続け、追加 Subscribe に対応
             loop {
-                let (header, payload) = match rx.recv().await {
-                    Ok(v) => v,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("subscriber lagged, skipped {n} messages");
-                        continue;
+                match recv_message(&mut control_recv).await {
+                    Ok(Message::Subscribe(s2)) => {
+                        tracing::info!("additional subscribe for {}/{}", s2.track_namespace, s2.track_name);
+                        let ok = Message::SubscribeOk(SubscribeOk {
+                            track_namespace: s2.track_namespace.clone(),
+                            track_name: s2.track_name.clone(),
+                        });
+                        if send_message(&mut control_send, &ok).await.is_err() {
+                            break;
+                        }
+                        let rx = {
+                            let mut map = tracks.lock().await;
+                            let key = (s2.track_namespace.clone(), s2.track_name.clone());
+                            let tx = map
+                                .entry(key)
+                                .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
+                                .clone();
+                            tx.subscribe()
+                        };
+                        let conn = connection.clone();
+                        tokio::spawn(forward_track(conn, rx));
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                };
-
-                let mut send = match connection.open_uni().await {
-                    Ok(opening) => match opening.await {
-                        Ok(s) => s,
-                        Err(_) => break,
-                    },
+                    Ok(other) => {
+                        tracing::warn!("unexpected message from subscriber: {:?}", other);
+                    }
                     Err(_) => break,
-                };
-
-                let mut buf = BytesMut::new();
-                header.encode(&mut buf);
-                if send.write_all(&buf).await.is_err() {
-                    break;
                 }
-                if send.write_all(&payload).await.is_err() {
-                    break;
-                }
-                let _ = send.finish().await;
             }
         }
 
@@ -821,6 +973,10 @@ let frameCount = 0;
 let fpsStartTime = 0;
 const KEY_FRAME_INTERVAL = 30; // 15fps * 2sec
 
+let audioEncoder = null;
+let audioObjectId = 0;
+let audioProcessorReader = null;
+
 function setStatus(text, cls) {{
   statusEl.textContent = text;
   statusEl.className = cls || '';
@@ -864,10 +1020,11 @@ async function initCamera() {{
   canvas.height = 480;
   try {{
     const stream = await navigator.mediaDevices.getUserMedia({{
-      video: {{ width: 640, height: 480 }}
+      video: {{ width: 640, height: 480 }},
+      audio: {{ sampleRate: 48000, channelCount: 1 }}
     }});
     preview.srcObject = stream;
-    setStatus('Camera ready. Click "Start Publishing".', '');
+    setStatus('Camera + Mic ready. Click "Start Publishing".', '');
   }} catch (e) {{
     console.warn('Camera unavailable, using test pattern:', e.message);
     useTestPattern = true;
@@ -908,13 +1065,24 @@ async function startPublishing() {{
     }}
     console.log('ServerSetup received, version=0x' + serverSetup.version.toString(16));
 
-    // Publish 送信 → PublishOk 受信
+    // Publish (video) 送信 → PublishOk 受信
     await writer.write(encodePublish('live', 'video'));
     let result = await readMessage(reader, remaining);
     if (result.msg.type !== 'PublishOk') {{
       throw new Error('Expected PublishOk, got ' + result.msg.type);
     }}
     console.log('PublishOk received for ' + result.msg.namespace + '/' + result.msg.name);
+
+    // Publish (audio) 送信 → PublishOk 受信 (テストパターンモードではスキップ)
+    if (!useTestPattern) {{
+      await writer.write(encodePublish('live', 'audio'));
+      let audioResult = await readMessage(reader, result.remaining);
+      result.remaining = audioResult.remaining;
+      if (audioResult.msg.type !== 'PublishOk') {{
+        throw new Error('Expected PublishOk for audio, got ' + audioResult.msg.type);
+      }}
+      console.log('PublishOk received for ' + audioResult.msg.namespace + '/' + audioResult.msg.name);
+    }}
 
     // H.264 VideoEncoder 初期化
     encoder = new VideoEncoder({{
@@ -965,6 +1133,55 @@ async function startPublishing() {{
     }});
 
     publishing = true;
+
+    // AudioEncoder 初期化 + 音声処理ループ (テストパターンモードではスキップ)
+    if (!useTestPattern) {{
+      audioObjectId = 0;
+      audioEncoder = new AudioEncoder({{
+        output: async (chunk) => {{
+          try {{
+            const buf = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(buf);
+            const header = encodeObjectHeader('live', 'audio', 0, audioObjectId, buf.length);
+            audioObjectId++;
+
+            const uni = await transport.createUnidirectionalStream();
+            const w = uni.getWriter();
+            await w.write(concatBytes([header, buf]));
+            await w.close();
+          }} catch (e) {{
+            console.error('audio send error:', e);
+          }}
+        }},
+        error: (e) => {{
+          console.error('audio encoder error:', e);
+        }}
+      }});
+      audioEncoder.configure({{
+        codec: 'opus',
+        sampleRate: 48000,
+        numberOfChannels: 1,
+        bitrate: 64000,
+      }});
+
+      // MediaStreamTrackProcessor で音声トラック → AudioData → encode
+      const audioTrack = preview.srcObject.getAudioTracks()[0];
+      if (audioTrack) {{
+        const audioProcessor = new MediaStreamTrackProcessor({{ track: audioTrack }});
+        audioProcessorReader = audioProcessor.readable.getReader();
+        (async () => {{
+          while (publishing) {{
+            const {{ done, value: audioData }} = await audioProcessorReader.read();
+            if (done) break;
+            if (audioEncoder && audioEncoder.state !== 'closed') {{
+              audioEncoder.encode(audioData);
+            }}
+            audioData.close();
+          }}
+        }})();
+      }}
+    }}
+
     totalFramesSent = 0;
     groupId = -1;
     objectIdInGroup = 0;
@@ -1008,6 +1225,14 @@ function stopPublishing() {{
     encoder.close();
   }}
   encoder = null;
+  if (audioEncoder && audioEncoder.state !== 'closed') {{
+    audioEncoder.close();
+  }}
+  audioEncoder = null;
+  if (audioProcessorReader) {{
+    audioProcessorReader.cancel();
+    audioProcessorReader = null;
+  }}
   if (transport) {{
     transport.close();
     transport = null;
