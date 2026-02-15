@@ -56,8 +56,9 @@ async fn run_publisher() -> Result<()> {
         connection,
         control_send,
         control_recv,
-        TRACK_NAMESPACE.to_string(),
+        vec![TRACK_NAMESPACE.to_string()],
         TRACK_NAME.to_string(),
+        0, // track_alias
     )
     .await?;
 
@@ -88,19 +89,21 @@ async fn run_subscriber() -> Result<()> {
         connection,
         control_send,
         control_recv,
-        TRACK_NAMESPACE.to_string(),
+        vec![TRACK_NAMESPACE.to_string()],
         TRACK_NAME.to_string(),
+        0, // subscribe_id
+        0, // track_alias
     )
     .await?;
 
     tracing::info!("subscriber ready. waiting for objects...");
 
     loop {
-        let (header, payload) = subscriber.recv_object().await?;
+        let (header, object_id, payload) = subscriber.recv_object().await?;
         let text = String::from_utf8_lossy(&payload);
         println!(
             "[group={} id={}] {}",
-            header.group_id, header.object_id, text
+            header.group_id, object_id, text
         );
     }
 }
@@ -116,8 +119,9 @@ async fn run_video_publisher() -> Result<()> {
         connection,
         control_send,
         control_recv,
-        TRACK_NAMESPACE.to_string(),
+        vec![TRACK_NAMESPACE.to_string()],
         VIDEO_TRACK_NAME.to_string(),
+        0, // track_alias
     )
     .await?;
 
@@ -182,8 +186,10 @@ async fn run_video_subscriber() -> Result<()> {
         connection,
         control_send,
         control_recv,
-        TRACK_NAMESPACE.to_string(),
+        vec![TRACK_NAMESPACE.to_string()],
         VIDEO_TRACK_NAME.to_string(),
+        0, // subscribe_id
+        0, // track_alias
     )
     .await?;
 
@@ -231,7 +237,7 @@ async fn run_video_subscriber() -> Result<()> {
         )
         .await;
 
-        if let Ok(Ok((_header, payload))) = recv_result {
+        if let Ok(Ok((_header, _object_id, payload))) = recv_result {
             // JPEG → RGB デコード
             match image::load_from_memory_with_format(&payload, image::ImageFormat::Jpeg) {
                 Ok(img) => {

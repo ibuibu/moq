@@ -1,9 +1,18 @@
 // --- Viewer-specific MoQ Messages ---
+let nextSubscribeId = 0;
 function encodeSubscribe(namespace, name) {
+  const subscribeId = nextSubscribeId;
+  const trackAlias = nextSubscribeId;
+  nextSubscribeId++;
   const msgType = encodeVarInt(0x03); // SUBSCRIBE
-  const ns = encodeString(namespace);
+  const sid = encodeVarInt(subscribeId);
+  const alias = encodeVarInt(trackAlias);
+  const ns = encodeTuple([namespace]);
   const nm = encodeString(name);
-  const payload = concatBytes([ns, nm]);
+  const priority = new Uint8Array([0]); // subscriber_priority
+  const groupOrder = new Uint8Array([0x01]); // GROUP_ORDER_ASCENDING
+  const filterType = encodeVarInt(0x01); // FILTER_NEXT_GROUP
+  const payload = concatBytes([sid, alias, ns, nm, priority, groupOrder, filterType]);
   const length = encodeUint16(payload.length);
   return concatBytes([msgType, length, payload]);
 }
@@ -35,30 +44,52 @@ function decodeMessage(buf) {
   }
 
   if (msgType === 0x04) { // SUBSCRIBE_OK
-    const { value: ns, bytesRead: b2 } = decodeString(buf, offset);
+    const { value: subscribeId, bytesRead: b2 } = decodeVarInt(buf, offset);
     offset += b2;
-    const { value: name, bytesRead: b3 } = decodeString(buf, offset);
+    const { value: expires, bytesRead: b3 } = decodeVarInt(buf, offset);
     offset += b3;
-    return { type: 'SubscribeOk', namespace: ns, name, totalBytes: payloadStart + length };
+    const groupOrder = buf[offset]; offset += 1;
+    const contentExists = buf[offset]; offset += 1;
+    return { type: 'SubscribeOk', subscribeId, expires, groupOrder, contentExists, totalBytes: payloadStart + length };
+  }
+
+  if (msgType === 0x05) { // REQUEST_ERROR
+    const { value: subscribeId, bytesRead: b2 } = decodeVarInt(buf, offset);
+    offset += b2;
+    const { value: errorCode, bytesRead: b3 } = decodeVarInt(buf, offset);
+    offset += b3;
+    const { value: reasonPhrase, bytesRead: b4 } = decodeString(buf, offset);
+    offset += b4;
+    return { type: 'RequestError', subscribeId, errorCode, reasonPhrase, totalBytes: payloadStart + length };
+  }
+
+  if (msgType === 0x10) { // GOAWAY
+    const { value: newSessionUri, bytesRead: b2 } = decodeString(buf, offset);
+    offset += b2;
+    return { type: 'GoAway', newSessionUri, totalBytes: payloadStart + length };
   }
 
   throw new Error('unknown message type: 0x' + msgType.toString(16));
 }
 
-// --- ObjectHeader decode ---
-function decodeObjectHeader(buf) {
+// --- SubgroupHeader + Object entry decode ---
+function decodeSubgroupStream(buf) {
   let offset = 0;
-  const { value: ns, bytesRead: b1 } = decodeString(buf, offset);
+  const { value: subscribeId, bytesRead: b1 } = decodeVarInt(buf, offset);
   offset += b1;
-  const { value: name, bytesRead: b2 } = decodeString(buf, offset);
+  const { value: trackAlias, bytesRead: b2 } = decodeVarInt(buf, offset);
   offset += b2;
   const { value: groupId, bytesRead: b3 } = decodeVarInt(buf, offset);
   offset += b3;
-  const { value: objectId, bytesRead: b4 } = decodeVarInt(buf, offset);
+  const { value: subgroupId, bytesRead: b4 } = decodeVarInt(buf, offset);
   offset += b4;
-  const { value: payloadLength, bytesRead: b5 } = decodeVarInt(buf, offset);
+  const publisherPriority = buf[offset]; offset += 1;
+  // Object entry
+  const { value: objectId, bytesRead: b5 } = decodeVarInt(buf, offset);
   offset += b5;
-  return { ns, name, groupId, objectId, payloadLength, headerSize: offset };
+  const { value: payloadLength, bytesRead: b6 } = decodeVarInt(buf, offset);
+  offset += b6;
+  return { subscribeId, trackAlias, groupId, subgroupId, publisherPriority, objectId, payloadLength, headerSize: offset };
 }
 
 // --- Main ---
@@ -131,7 +162,7 @@ async function start() {
     if (result.msg.type !== 'SubscribeOk') {
       throw new Error('Expected SubscribeOk, got ' + result.msg.type);
     }
-    console.log('SubscribeOk received for ' + result.msg.namespace + '/' + result.msg.name);
+    console.log('SubscribeOk received subscribe_id=' + result.msg.subscribeId);
 
     // Subscribe (audio) 送信 → SubscribeOk 受信
     await writer.write(encodeSubscribe('live', 'audio'));
@@ -139,7 +170,7 @@ async function start() {
     if (audioResult.msg.type !== 'SubscribeOk') {
       throw new Error('Expected SubscribeOk for audio, got ' + audioResult.msg.type);
     }
-    console.log('SubscribeOk received for ' + audioResult.msg.namespace + '/' + audioResult.msg.name);
+    console.log('SubscribeOk received subscribe_id=' + audioResult.msg.subscribeId);
     setStatus('Receiving video + audio...', 'connected');
 
     // H.264 VideoDecoder 初期化
@@ -231,12 +262,17 @@ async function start() {
   }
 }
 
+// trackAlias → trackName マッピング (subscribe 送信順)
+// video=0, audio=1
+const trackAliasMap = { 0: 'video', 1: 'audio' };
+
 async function handleObjectStream(stream) {
   const data = await readStream(stream.getReader());
-  const header = decodeObjectHeader(data);
+  const header = decodeSubgroupStream(data);
   const payload = data.slice(header.headerSize, header.headerSize + header.payloadLength);
 
-  if (header.name === 'audio') {
+  const trackName = trackAliasMap[header.trackAlias] || 'unknown';
+  if (trackName === 'audio') {
     // Opus 音声デコード (全フレーム key)
     const chunk = new EncodedAudioChunk({
       type: 'key',

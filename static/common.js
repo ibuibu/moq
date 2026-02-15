@@ -53,6 +53,29 @@ function decodeString(buf, offset) {
   return { value: str, bytesRead: bytesRead + len };
 }
 
+// --- Tuple encode/decode (draft-15 track_namespace) ---
+function encodeTuple(elements) {
+  const parts = [encodeVarInt(elements.length)];
+  for (const el of elements) {
+    parts.push(encodeString(el));
+  }
+  return concatBytes(parts);
+}
+
+function decodeTuple(buf, offset) {
+  const { value: numElements, bytesRead: b1 } = decodeVarInt(buf, offset);
+  let totalRead = b1;
+  offset += b1;
+  const elements = [];
+  for (let i = 0; i < numElements; i++) {
+    const { value: el, bytesRead: elb } = decodeString(buf, offset);
+    elements.push(el);
+    totalRead += elb;
+    offset += elb;
+  }
+  return { value: elements, bytesRead: totalRead };
+}
+
 function concatBytes(arrays) {
   const totalLen = arrays.reduce((sum, a) => sum + a.length, 0);
   const result = new Uint8Array(totalLen);

@@ -1,20 +1,26 @@
 // --- Publisher-specific MoQ Messages ---
 function encodePublish(namespace, name) {
   const msgType = encodeVarInt(0x1D); // PUBLISH (draft-15)
-  const ns = encodeString(namespace);
+  const ns = encodeTuple([namespace]);
   const nm = encodeString(name);
-  const payload = concatBytes([ns, nm]);
+  const priority = new Uint8Array([0]); // subscriber_priority
+  const groupOrder = new Uint8Array([0x01]); // GROUP_ORDER_ASCENDING
+  const numParams = encodeVarInt(0);
+  const payload = concatBytes([ns, nm, priority, groupOrder, numParams]);
   const length = encodeUint16(payload.length);
   return concatBytes([msgType, length, payload]);
 }
 
-function encodeObjectHeader(namespace, name, groupId, objectId, payloadLength) {
-  const ns = encodeString(namespace);
-  const nm = encodeString(name);
+function encodeSubgroupStream(trackAlias, groupId, objectId, payloadLength) {
+  const sid = encodeVarInt(0); // subscribe_id (not used by publisher)
+  const alias = encodeVarInt(trackAlias);
   const gid = encodeVarInt(groupId);
+  const sgid = encodeVarInt(0); // subgroup_id
+  const priority = new Uint8Array([0]); // publisher_priority
+  // object entry
   const oid = encodeVarInt(objectId);
   const plen = encodeVarInt(payloadLength);
-  return concatBytes([ns, nm, gid, oid, plen]);
+  return concatBytes([sid, alias, gid, sgid, priority, oid, plen]);
 }
 
 function decodeMessage(buf) {
@@ -43,11 +49,29 @@ function decodeMessage(buf) {
   }
 
   if (msgType === 0x1E) { // PUBLISH_OK (draft-15)
-    const { value: ns, bytesRead: b2 } = decodeString(buf, offset);
+    const { value: ns, bytesRead: b2 } = decodeTuple(buf, offset);
     offset += b2;
     const { value: name, bytesRead: b3 } = decodeString(buf, offset);
     offset += b3;
+    const { value: numParams, bytesRead: b4 } = decodeVarInt(buf, offset);
+    offset += b4;
     return { type: 'PublishOk', namespace: ns, name, totalBytes: payloadStart + length };
+  }
+
+  if (msgType === 0x05) { // REQUEST_ERROR
+    const { value: subscribeId, bytesRead: b2 } = decodeVarInt(buf, offset);
+    offset += b2;
+    const { value: errorCode, bytesRead: b3 } = decodeVarInt(buf, offset);
+    offset += b3;
+    const { value: reasonPhrase, bytesRead: b4 } = decodeString(buf, offset);
+    offset += b4;
+    return { type: 'RequestError', subscribeId, errorCode, reasonPhrase, totalBytes: payloadStart + length };
+  }
+
+  if (msgType === 0x10) { // GOAWAY
+    const { value: newSessionUri, bytesRead: b2 } = decodeString(buf, offset);
+    offset += b2;
+    return { type: 'GoAway', newSessionUri, totalBytes: payloadStart + length };
   }
 
   throw new Error('unknown message type: 0x' + msgType.toString(16));
@@ -195,7 +219,7 @@ async function startPublishing() {
             groupId++;
             objectIdInGroup = 0;
           }
-          const header = encodeObjectHeader('live', 'video', groupId, objectIdInGroup, buf.length);
+          const header = encodeSubgroupStream(0, groupId, objectIdInGroup, buf.length); // trackAlias=0 (video)
           objectIdInGroup++;
 
           const uni = await transport.createUnidirectionalStream();
@@ -242,7 +266,7 @@ async function startPublishing() {
           try {
             const buf = new Uint8Array(chunk.byteLength);
             chunk.copyTo(buf);
-            const header = encodeObjectHeader('live', 'audio', 0, audioObjectId, buf.length);
+            const header = encodeSubgroupStream(1, 0, audioObjectId, buf.length); // trackAlias=1 (audio)
             audioObjectId++;
 
             const uni = await transport.createUnidirectionalStream();
