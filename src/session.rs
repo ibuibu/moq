@@ -40,6 +40,19 @@ pub async fn recv_message(recv: &mut wtransport::stream::RecvStream) -> Result<M
 
 use bytes::Buf;
 
+/// unidirectional stream を全読み込みして Vec<u8> を返す
+pub async fn read_entire_stream(recv: &mut wtransport::stream::RecvStream) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; READ_BUF_SIZE];
+    loop {
+        match recv.read(&mut tmp).await? {
+            Some(n) => buf.extend_from_slice(&tmp[..n]),
+            None => break,
+        }
+    }
+    Ok(buf)
+}
+
 /// クライアント側 SETUP ハンドシェイク
 pub async fn client_setup(connection: &Connection) -> Result<(wtransport::stream::SendStream, wtransport::stream::RecvStream)> {
     let (mut send, mut recv) = connection.open_bi().await?.await?;

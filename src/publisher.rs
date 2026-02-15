@@ -7,13 +7,12 @@ use crate::session::{recv_message, send_message};
 use crate::varint::VarInt;
 
 /// Publisher: サーバーに PUBLISH を送り、Object を unidirectional stream で送信する
-#[allow(dead_code)]
 pub struct Publisher {
     connection: Connection,
-    control_send: wtransport::stream::SendStream,
-    control_recv: wtransport::stream::RecvStream,
-    track_namespace: TrackNamespace,
-    track_name: String,
+    _control_send: wtransport::stream::SendStream,
+    _control_recv: wtransport::stream::RecvStream,
+    _track_namespace: TrackNamespace,
+    _track_name: String,
     track_alias: u64,
     group_id: u64,
     object_id: u64,
@@ -48,10 +47,10 @@ impl Publisher {
 
         Ok(Self {
             connection,
-            control_send,
-            control_recv,
-            track_namespace,
-            track_name,
+            _control_send: control_send,
+            _control_recv: control_recv,
+            _track_namespace: track_namespace,
+            _track_name: track_name,
             track_alias,
             group_id: 0,
             object_id: 0,

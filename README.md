@@ -27,7 +27,6 @@ src/
   lib.rs             # ライブラリルート
   varint.rs          # QUIC 可変長整数 (RFC 9000 Section 16)
   message.rs         # MoQ メッセージ (ClientSetup, Subscribe, Publish, ObjectHeader, etc.)
-  error.rs           # エラー型
   session.rs         # SETUP ハンドシェイク・メッセージ送受信ヘルパー
   publisher.rs       # Publisher (Object 送信)
   subscriber.rs      # Subscriber (Object 受信)

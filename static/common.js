@@ -103,7 +103,53 @@ function encodeClientSetup() {
   return concatBytes([msgType, length, payload]);
 }
 
-// decodeMessage は各ページ側で定義（viewer/publisher で異なるメッセージを扱う）
+// --- Base message decoder (共通メッセージ: ServerSetup / REQUEST_ERROR / GOAWAY) ---
+function decodeMessageBase(buf) {
+  let offset = 0;
+  const { value: msgType, bytesRead: b1 } = decodeVarInt(buf, offset);
+  offset += b1;
+
+  // Length framing: u16 big-endian
+  if (offset + 2 > buf.length) throw new Error('not enough data for message length');
+  const length = new DataView(buf.buffer, buf.byteOffset + offset).getUint16(0);
+  offset += 2;
+  if (offset + length > buf.length) throw new Error('not enough data for message payload');
+  const payloadStart = offset;
+  const totalBytes = payloadStart + length;
+
+  if (msgType === 0x21) { // SERVER_SETUP (draft-15)
+    const { value: numParams, bytesRead: b2 } = decodeVarInt(buf, offset);
+    offset += b2;
+    for (let i = 0; i < numParams; i++) {
+      const { value: key, bytesRead: kb } = decodeVarInt(buf, offset);
+      offset += kb;
+      const { value: valLen, bytesRead: vlb } = decodeVarInt(buf, offset);
+      offset += vlb;
+      offset += valLen;
+    }
+    return { type: 'ServerSetup', totalBytes };
+  }
+
+  if (msgType === 0x05) { // REQUEST_ERROR
+    const { value: subscribeId, bytesRead: b2 } = decodeVarInt(buf, offset);
+    offset += b2;
+    const { value: errorCode, bytesRead: b3 } = decodeVarInt(buf, offset);
+    offset += b3;
+    const { value: reasonPhrase, bytesRead: b4 } = decodeString(buf, offset);
+    offset += b4;
+    return { type: 'RequestError', subscribeId, errorCode, reasonPhrase, totalBytes };
+  }
+
+  if (msgType === 0x10) { // GOAWAY
+    const { value: newSessionUri, bytesRead: b2 } = decodeString(buf, offset);
+    offset += b2;
+    return { type: 'GoAway', newSessionUri, totalBytes };
+  }
+
+  return { type: null, msgType, offset: payloadStart, length, totalBytes };
+}
+
+
 async function readMessage(reader, existingBuf) {
   let buf = existingBuf || new Uint8Array(0);
 

@@ -186,7 +186,7 @@ pub fn decode(buf: &mut Bytes) -> anyhow::Result<Self> {
 }
 ```
 
-### JavaScript 実装 (`static/common.js:98-125`)
+### JavaScript 実装 (`static/common.js:153-171`)
 
 ブラウザ側では `readMessage()` がストリームからデータを逐次読み込み、メッセージが完成するまでバッファリングします:
 
@@ -366,7 +366,7 @@ track_namespace(tuple) | track_name(string)
 | num_params(varint)
 ```
 
-### Rust 実装 (`src/publisher.rs:24-58`)
+### Rust 実装 (`src/publisher.rs:23-58`)
 
 ```rust
 pub async fn new(
@@ -443,7 +443,7 @@ subscribe_id(varint) | expires(varint)
 
 > **注目**: SUBSCRIBE_OK には Namespace や Name が含まれません。`subscribe_id` でどの SUBSCRIBE に対する応答かを対応付けます。
 
-### サーバー側の処理 (`src/bin/moq-server.rs:346-413`)
+### サーバー側の処理 (`src/bin/moq-server.rs` — `handle_subscriber()`)
 
 サーバーは SUBSCRIBE を受け取ると:
 1. `SubscribeOk` を返す
@@ -542,7 +542,7 @@ Group 1: [KeyFrame, DeltaFrame, DeltaFrame, ..., DeltaFrame]  (30フレーム)
  ↑ SubgroupHeader        ↑ Object Entry
 ```
 
-### Publisher 側: Object 送信 (`src/publisher.rs:62-91`)
+### Publisher 側: Object 送信 (`src/publisher.rs:61-90`)
 
 ```rust
 pub async fn send_object(&mut self, payload: &[u8]) -> Result<()> {
@@ -572,22 +572,15 @@ pub async fn send_object(&mut self, payload: &[u8]) -> Result<()> {
 }
 ```
 
-### Subscriber 側: Object 受信 (`src/subscriber.rs:74-101`)
+### Subscriber 側: Object 受信 (`src/subscriber.rs:73-92`)
 
 ```rust
 pub async fn recv_object(&self) -> Result<(SubgroupHeader, u64, Vec<u8>)> {
     // 1. Unidirectional stream を受け入れ
     let mut recv = self.connection.accept_uni().await?;
 
-    // 2. ストリーム全体を読み込み
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 65536];
-    loop {
-        match recv.read(&mut tmp).await? {
-            Some(n) => buf.extend_from_slice(&tmp[..n]),
-            None => break,
-        }
-    }
+    // 2. ストリーム全体を読み込み (session.rs の共通ヘルパー)
+    let buf = read_entire_stream(&mut recv).await?;
 
     // 3. SubgroupHeader + Object entry をデコード
     let mut data = Bytes::from(buf);

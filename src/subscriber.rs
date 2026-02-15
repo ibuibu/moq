@@ -5,19 +5,18 @@ use crate::message::{
     Message, Subscribe, SubgroupHeader, TrackNamespace, Unsubscribe, FILTER_NEXT_GROUP,
     GROUP_ORDER_ASCENDING,
 };
-use crate::session::{recv_message, send_message};
+use crate::session::{read_entire_stream, recv_message, send_message};
 use crate::varint::VarInt;
 
 /// Subscriber: サーバーに SUBSCRIBE を送り、Object を受信する
-#[allow(dead_code)]
 pub struct Subscriber {
     connection: Connection,
     control_send: wtransport::stream::SendStream,
-    control_recv: wtransport::stream::RecvStream,
-    track_namespace: TrackNamespace,
-    track_name: String,
+    _control_recv: wtransport::stream::RecvStream,
+    _track_namespace: TrackNamespace,
+    _track_name: String,
     subscribe_id: u64,
-    track_alias: u64,
+    _track_alias: u64,
 }
 
 impl Subscriber {
@@ -61,11 +60,11 @@ impl Subscriber {
         Ok(Self {
             connection,
             control_send,
-            control_recv,
-            track_namespace,
-            track_name,
+            _control_recv: control_recv,
+            _track_namespace: track_namespace,
+            _track_name: track_name,
             subscribe_id,
-            track_alias,
+            _track_alias: track_alias,
         })
     }
 
@@ -73,15 +72,7 @@ impl Subscriber {
     /// 戻り値: (SubgroupHeader, object_id, payload)
     pub async fn recv_object(&self) -> Result<(SubgroupHeader, u64, Vec<u8>)> {
         let mut recv = self.connection.accept_uni().await?;
-
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 65536];
-        loop {
-            match recv.read(&mut tmp).await? {
-                Some(n) => buf.extend_from_slice(&tmp[..n]),
-                None => break,
-            }
-        }
+        let buf = read_entire_stream(&mut recv).await?;
 
         let mut data = bytes::Bytes::from(buf);
         let header = SubgroupHeader::decode(&mut data)?;

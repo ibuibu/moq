@@ -12,7 +12,7 @@ use wtransport::Identity;
 use wtransport::ServerConfig;
 
 use moq::message::{Message, PublishOk, SubgroupHeader, SubscribeOk, TrackNamespace, GROUP_ORDER_ASCENDING};
-use moq::session::{recv_message, send_message, server_setup};
+use moq::session::{read_entire_stream, recv_message, send_message, server_setup};
 use moq::varint::VarInt;
 
 /// 中継用オブジェクト
@@ -59,8 +59,8 @@ async fn main() -> Result<()> {
     );
 
     // HTTP サーバー (HTML / JS 配信)
-    let viewer_html = generate_viewer_html(&cert_hash, &host_ip);
-    let publisher_html = generate_publisher_html(&cert_hash, &host_ip);
+    let viewer_html = generate_html(include_str!("../../static/viewer.html"), &cert_hash, &host_ip);
+    let publisher_html = generate_html(include_str!("../../static/publisher.html"), &cert_hash, &host_ip);
     tokio::spawn(async move {
         if let Err(e) = run_http_server(viewer_html, publisher_html).await {
             tracing::error!("HTTP server error: {e}");
@@ -154,14 +154,14 @@ fn detect_host_ip() -> String {
     "127.0.0.1".to_string()
 }
 
-fn generate_viewer_html(cert_hash: &[u8; 32], host_ip: &str) -> String {
+fn generate_html(template: &str, cert_hash: &[u8; 32], host_ip: &str) -> String {
     let hash_array = cert_hash
         .iter()
         .map(|b| format!("0x{b:02x}"))
         .collect::<Vec<_>>()
         .join(", ");
 
-    include_str!("../../static/viewer.html")
+    template
         .replace("__CERT_HASH__", &hash_array)
         .replace("__HOST_IP__", host_ip)
 }
@@ -221,214 +221,215 @@ async fn handle_session(
     tracing::info!("new session from {}", session_request.remote_address());
 
     let connection = session_request.accept().await?;
-    let (mut control_send, mut control_recv) = server_setup(&connection).await?;
+    let (control_send, mut control_recv) = server_setup(&connection).await?;
 
     // 次のメッセージで Publisher か Subscriber かを判別
     let msg = recv_message(&mut control_recv).await?;
     match msg {
         Message::Publish(p) => {
-            tracing::info!("publisher for {:?}/{}", p.track_namespace, p.track_name);
-
-            // 最初の PublishOk を返す
-            let ok = Message::PublishOk(PublishOk {
-                track_namespace: p.track_namespace.clone(),
-                track_name: p.track_name.clone(),
-            });
-            send_message(&mut control_send, &ok).await?;
-
-            // publisher_tracks: track_alias (= index) → TrackKey マッピング
-            let mut publisher_tracks: Vec<TrackKey> = Vec::new();
-            let first_key = (p.track_namespace.clone(), p.track_name.clone());
-
-            // 最初のトラックの broadcast チャネルを作成
-            {
-                let mut map = tracks.lock().await;
-                map.entry(first_key.clone())
-                    .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0);
-            }
-            publisher_tracks.push(first_key);
-
-            // 制御ストリームをバックグラウンドで読み続け、追加 Publish に対応
-            let tracks_ctrl = tracks.clone();
-            let publisher_tracks_shared = Arc::new(Mutex::new(publisher_tracks));
-            let publisher_tracks_ctrl = publisher_tracks_shared.clone();
-            tokio::spawn(async move {
-                loop {
-                    match recv_message(&mut control_recv).await {
-                        Ok(Message::Publish(p2)) => {
-                            tracing::info!("additional publish for {:?}/{}", p2.track_namespace, p2.track_name);
-                            let ok = Message::PublishOk(PublishOk {
-                                track_namespace: p2.track_namespace.clone(),
-                                track_name: p2.track_name.clone(),
-                            });
-                            if send_message(&mut control_send, &ok).await.is_err() {
-                                break;
-                            }
-                            let key = (p2.track_namespace.clone(), p2.track_name.clone());
-                            {
-                                let mut map = tracks_ctrl.lock().await;
-                                map.entry(key.clone())
-                                    .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0);
-                            }
-                            publisher_tracks_ctrl.lock().await.push(key);
-                        }
-                        Ok(Message::GoAway(g)) => {
-                            tracing::info!("received GoAway from publisher: {}", g.new_session_uri);
-                        }
-                        Ok(other) => {
-                            tracing::warn!("unexpected message from publisher: {:?}", other);
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            // Publisher からの unidirectional stream を受け取って broadcast
-            // SubgroupHeader の track_alias でルーティング
-            loop {
-                let mut recv = match connection.accept_uni().await {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 65536];
-                loop {
-                    match recv.read(&mut tmp).await? {
-                        Some(n) => buf.extend_from_slice(&tmp[..n]),
-                        None => break,
-                    }
-                }
-
-                let mut data = bytes::Bytes::from(buf);
-                let header = SubgroupHeader::decode(&mut data)?;
-                let object_id = VarInt::decode(&mut data)?.into_inner();
-                let payload_length = VarInt::decode(&mut data)?.into_inner() as usize;
-                let payload = data[..payload_length].to_vec();
-
-                // track_alias → TrackKey でルーティング
-                let alias = header.track_alias as usize;
-                let key = {
-                    let pt = publisher_tracks_shared.lock().await;
-                    if alias < pt.len() {
-                        pt[alias].clone()
-                    } else {
-                        tracing::warn!("unknown track_alias {alias}");
-                        continue;
-                    }
-                };
-
-                tracing::info!(
-                    "relaying object {:?}/{} group={} obj={} len={}",
-                    key.0,
-                    key.1,
-                    header.group_id,
-                    object_id,
-                    payload.len()
-                );
-
-                let tx = {
-                    let mut map = tracks.lock().await;
-                    map.entry(key)
-                        .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
-                        .clone()
-                };
-                let _ = tx.send(RelayObject {
-                    group_id: header.group_id,
-                    object_id,
-                    subgroup_id: header.subgroup_id,
-                    publisher_priority: header.publisher_priority,
-                    payload,
-                });
-            }
+            handle_publisher(connection, control_send, control_recv, p, tracks).await
         }
-
         Message::Subscribe(s) => {
-            tracing::info!("subscriber for {:?}/{}", s.track_namespace, s.track_name);
-
-            // SubscribeOk を返す
-            let ok = Message::SubscribeOk(SubscribeOk {
-                subscribe_id: s.subscribe_id,
-                expires: 0,
-                group_order: GROUP_ORDER_ASCENDING,
-                content_exists: false,
-            });
-            send_message(&mut control_send, &ok).await?;
-
-            // subscriber_tracks: TrackKey → (subscribe_id, track_alias)
-            let mut subscriber_tracks: HashMap<TrackKey, (u64, u64)> = HashMap::new();
-            let first_key = (s.track_namespace.clone(), s.track_name.clone());
-            subscriber_tracks.insert(first_key.clone(), (s.subscribe_id, s.track_alias));
-
-            // 最初のトラック転送を spawn
-            let rx = {
-                let mut map = tracks.lock().await;
-                let tx = map
-                    .entry(first_key)
-                    .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
-                    .clone();
-                tx.subscribe()
-            };
-            let conn = connection.clone();
-            tokio::spawn(forward_track(conn, s.subscribe_id, s.track_alias, rx));
-
-            // 制御ストリームを読み続け、追加 Subscribe に対応
-            loop {
-                match recv_message(&mut control_recv).await {
-                    Ok(Message::Subscribe(s2)) => {
-                        tracing::info!("additional subscribe for {:?}/{}", s2.track_namespace, s2.track_name);
-                        let ok = Message::SubscribeOk(SubscribeOk {
-                            subscribe_id: s2.subscribe_id,
-                            expires: 0,
-                            group_order: GROUP_ORDER_ASCENDING,
-                            content_exists: false,
-                        });
-                        if send_message(&mut control_send, &ok).await.is_err() {
-                            break;
-                        }
-                        let key = (s2.track_namespace.clone(), s2.track_name.clone());
-                        subscriber_tracks.insert(key.clone(), (s2.subscribe_id, s2.track_alias));
-                        let rx = {
-                            let mut map = tracks.lock().await;
-                            let tx = map
-                                .entry(key)
-                                .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
-                                .clone();
-                            tx.subscribe()
-                        };
-                        let conn = connection.clone();
-                        tokio::spawn(forward_track(conn, s2.subscribe_id, s2.track_alias, rx));
-                    }
-                    Ok(Message::Unsubscribe(u)) => {
-                        tracing::info!("received Unsubscribe subscribe_id={}", u.subscribe_id);
-                    }
-                    Ok(Message::GoAway(g)) => {
-                        tracing::info!("received GoAway from subscriber: {}", g.new_session_uri);
-                    }
-                    Ok(other) => {
-                        tracing::warn!("unexpected message from subscriber: {:?}", other);
-                    }
-                    Err(_) => break,
-                }
-            }
+            handle_subscriber(connection, control_send, control_recv, s, tracks).await
         }
-
         other => {
             anyhow::bail!("expected Publish or Subscribe, got {:?}", other);
+        }
+    }
+}
+
+async fn handle_publisher(
+    connection: wtransport::Connection,
+    mut control_send: wtransport::stream::SendStream,
+    mut control_recv: wtransport::stream::RecvStream,
+    p: moq::message::Publish,
+    tracks: TrackChannels,
+) -> Result<()> {
+    tracing::info!("publisher for {:?}/{}", p.track_namespace, p.track_name);
+
+    // 最初の PublishOk を返す
+    let ok = Message::PublishOk(PublishOk {
+        track_namespace: p.track_namespace.clone(),
+        track_name: p.track_name.clone(),
+    });
+    send_message(&mut control_send, &ok).await?;
+
+    // publisher_tracks: track_alias (= index) → TrackKey マッピング
+    let mut publisher_tracks: Vec<TrackKey> = Vec::new();
+    let first_key = (p.track_namespace.clone(), p.track_name.clone());
+
+    // 最初のトラックの broadcast チャネルを作成
+    {
+        let mut map = tracks.lock().await;
+        map.entry(first_key.clone())
+            .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0);
+    }
+    publisher_tracks.push(first_key);
+
+    // 制御ストリームをバックグラウンドで読み続け、追加 Publish に対応
+    let tracks_ctrl = tracks.clone();
+    let publisher_tracks_shared = Arc::new(Mutex::new(publisher_tracks));
+    let publisher_tracks_ctrl = publisher_tracks_shared.clone();
+    tokio::spawn(async move {
+        loop {
+            match recv_message(&mut control_recv).await {
+                Ok(Message::Publish(p2)) => {
+                    tracing::info!("additional publish for {:?}/{}", p2.track_namespace, p2.track_name);
+                    let ok = Message::PublishOk(PublishOk {
+                        track_namespace: p2.track_namespace.clone(),
+                        track_name: p2.track_name.clone(),
+                    });
+                    if send_message(&mut control_send, &ok).await.is_err() {
+                        break;
+                    }
+                    let key = (p2.track_namespace.clone(), p2.track_name.clone());
+                    {
+                        let mut map = tracks_ctrl.lock().await;
+                        map.entry(key.clone())
+                            .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0);
+                    }
+                    publisher_tracks_ctrl.lock().await.push(key);
+                }
+                Ok(Message::GoAway(g)) => {
+                    tracing::info!("received GoAway from publisher: {}", g.new_session_uri);
+                }
+                Ok(other) => {
+                    tracing::warn!("unexpected message from publisher: {:?}", other);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Publisher からの unidirectional stream を受け取って broadcast
+    loop {
+        let mut recv = match connection.accept_uni().await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
+        let buf = read_entire_stream(&mut recv).await?;
+
+        let mut data = bytes::Bytes::from(buf);
+        let header = SubgroupHeader::decode(&mut data)?;
+        let object_id = VarInt::decode(&mut data)?.into_inner();
+        let payload_length = VarInt::decode(&mut data)?.into_inner() as usize;
+        let payload = data[..payload_length].to_vec();
+
+        // track_alias → TrackKey でルーティング
+        let alias = header.track_alias as usize;
+        let key = {
+            let pt = publisher_tracks_shared.lock().await;
+            if alias < pt.len() {
+                pt[alias].clone()
+            } else {
+                tracing::warn!("unknown track_alias {alias}");
+                continue;
+            }
+        };
+
+        tracing::info!(
+            "relaying object {:?}/{} group={} obj={} len={}",
+            key.0,
+            key.1,
+            header.group_id,
+            object_id,
+            payload.len()
+        );
+
+        let tx = {
+            let mut map = tracks.lock().await;
+            map.entry(key)
+                .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
+                .clone()
+        };
+        let _ = tx.send(RelayObject {
+            group_id: header.group_id,
+            object_id,
+            subgroup_id: header.subgroup_id,
+            publisher_priority: header.publisher_priority,
+            payload,
+        });
+    }
+
+    Ok(())
+}
+
+async fn handle_subscriber(
+    connection: wtransport::Connection,
+    mut control_send: wtransport::stream::SendStream,
+    mut control_recv: wtransport::stream::RecvStream,
+    s: moq::message::Subscribe,
+    tracks: TrackChannels,
+) -> Result<()> {
+    tracing::info!("subscriber for {:?}/{}", s.track_namespace, s.track_name);
+
+    // SubscribeOk を返す
+    let ok = Message::SubscribeOk(SubscribeOk {
+        subscribe_id: s.subscribe_id,
+        expires: 0,
+        group_order: GROUP_ORDER_ASCENDING,
+        content_exists: false,
+    });
+    send_message(&mut control_send, &ok).await?;
+
+    // subscriber_tracks: TrackKey → (subscribe_id, track_alias)
+    let mut subscriber_tracks: HashMap<TrackKey, (u64, u64)> = HashMap::new();
+    let first_key = (s.track_namespace.clone(), s.track_name.clone());
+    subscriber_tracks.insert(first_key.clone(), (s.subscribe_id, s.track_alias));
+
+    // 最初のトラック転送を spawn
+    let rx = {
+        let mut map = tracks.lock().await;
+        let tx = map
+            .entry(first_key)
+            .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
+            .clone();
+        tx.subscribe()
+    };
+    let conn = connection.clone();
+    tokio::spawn(forward_track(conn, s.subscribe_id, s.track_alias, rx));
+
+    // 制御ストリームを読み続け、追加 Subscribe に対応
+    loop {
+        match recv_message(&mut control_recv).await {
+            Ok(Message::Subscribe(s2)) => {
+                tracing::info!("additional subscribe for {:?}/{}", s2.track_namespace, s2.track_name);
+                let ok = Message::SubscribeOk(SubscribeOk {
+                    subscribe_id: s2.subscribe_id,
+                    expires: 0,
+                    group_order: GROUP_ORDER_ASCENDING,
+                    content_exists: false,
+                });
+                if send_message(&mut control_send, &ok).await.is_err() {
+                    break;
+                }
+                let key = (s2.track_namespace.clone(), s2.track_name.clone());
+                subscriber_tracks.insert(key.clone(), (s2.subscribe_id, s2.track_alias));
+                let rx = {
+                    let mut map = tracks.lock().await;
+                    let tx = map
+                        .entry(key)
+                        .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
+                        .clone();
+                    tx.subscribe()
+                };
+                let conn = connection.clone();
+                tokio::spawn(forward_track(conn, s2.subscribe_id, s2.track_alias, rx));
+            }
+            Ok(Message::Unsubscribe(u)) => {
+                tracing::info!("received Unsubscribe subscribe_id={}", u.subscribe_id);
+            }
+            Ok(Message::GoAway(g)) => {
+                tracing::info!("received GoAway from subscriber: {}", g.new_session_uri);
+            }
+            Ok(other) => {
+                tracing::warn!("unexpected message from subscriber: {:?}", other);
+            }
+            Err(_) => break,
         }
     }
 
     Ok(())
 }
 
-fn generate_publisher_html(cert_hash: &[u8; 32], host_ip: &str) -> String {
-    let hash_array = cert_hash
-        .iter()
-        .map(|b| format!("0x{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    include_str!("../../static/publisher.html")
-        .replace("__CERT_HASH__", &hash_array)
-        .replace("__HOST_IP__", host_ip)
-}

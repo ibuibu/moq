@@ -24,57 +24,22 @@ function encodeSubgroupStream(trackAlias, groupId, objectId, payloadLength) {
 }
 
 function decodeMessage(buf) {
-  let offset = 0;
-  const { value: msgType, bytesRead: b1 } = decodeVarInt(buf, offset);
-  offset += b1;
+  const base = decodeMessageBase(buf);
+  if (base.type) return base;
 
-  // Length framing: u16 big-endian
-  if (offset + 2 > buf.length) throw new Error('not enough data for message length');
-  const length = new DataView(buf.buffer, buf.byteOffset + offset).getUint16(0);
-  offset += 2;
-  if (offset + length > buf.length) throw new Error('not enough data for message payload');
-  const payloadStart = offset;
-
-  if (msgType === 0x21) { // SERVER_SETUP (draft-15)
-    const { value: numParams, bytesRead: b2 } = decodeVarInt(buf, offset);
-    offset += b2;
-    for (let i = 0; i < numParams; i++) {
-      const { value: key, bytesRead: kb } = decodeVarInt(buf, offset);
-      offset += kb;
-      const { value: valLen, bytesRead: vlb } = decodeVarInt(buf, offset);
-      offset += vlb;
-      offset += valLen; // skip value
-    }
-    return { type: 'ServerSetup', totalBytes: payloadStart + length };
-  }
-
-  if (msgType === 0x1E) { // PUBLISH_OK (draft-15)
+  // publisher 固有: PUBLISH_OK (0x1E)
+  let offset = base.offset;
+  if (base.msgType === 0x1E) {
     const { value: ns, bytesRead: b2 } = decodeTuple(buf, offset);
     offset += b2;
     const { value: name, bytesRead: b3 } = decodeString(buf, offset);
     offset += b3;
     const { value: numParams, bytesRead: b4 } = decodeVarInt(buf, offset);
     offset += b4;
-    return { type: 'PublishOk', namespace: ns, name, totalBytes: payloadStart + length };
+    return { type: 'PublishOk', namespace: ns, name, totalBytes: base.totalBytes };
   }
 
-  if (msgType === 0x05) { // REQUEST_ERROR
-    const { value: subscribeId, bytesRead: b2 } = decodeVarInt(buf, offset);
-    offset += b2;
-    const { value: errorCode, bytesRead: b3 } = decodeVarInt(buf, offset);
-    offset += b3;
-    const { value: reasonPhrase, bytesRead: b4 } = decodeString(buf, offset);
-    offset += b4;
-    return { type: 'RequestError', subscribeId, errorCode, reasonPhrase, totalBytes: payloadStart + length };
-  }
-
-  if (msgType === 0x10) { // GOAWAY
-    const { value: newSessionUri, bytesRead: b2 } = decodeString(buf, offset);
-    offset += b2;
-    return { type: 'GoAway', newSessionUri, totalBytes: payloadStart + length };
-  }
-
-  throw new Error('unknown message type: 0x' + msgType.toString(16));
+  throw new Error('unknown message type: 0x' + base.msgType.toString(16));
 }
 
 // --- Main ---
@@ -163,147 +128,151 @@ async function initCamera() {
   startBtn.disabled = false;
 }
 
+async function setupConnection() {
+  setStatus('Connecting to WebTransport...');
+  transport = new WebTransport('https://' + HOST_IP + ':4433', {
+    serverCertificateHashes: [{
+      algorithm: 'sha-256',
+      value: CERT_HASH.buffer,
+    }],
+  });
+  await transport.ready;
+  setStatus('Connected! Setting up...', 'connected');
+
+  const bidi = await transport.createBidirectionalStream();
+  const writer = bidi.writable.getWriter();
+  const reader = bidi.readable.getReader();
+
+  // ClientSetup → ServerSetup
+  await writer.write(encodeClientSetup());
+  let { msg: serverSetup, remaining } = await readMessage(reader);
+  if (serverSetup.type !== 'ServerSetup') {
+    throw new Error('Expected ServerSetup, got ' + serverSetup.type);
+  }
+  console.log('ServerSetup received');
+
+  // Publish (video) → PublishOk
+  await writer.write(encodePublish('live', 'video'));
+  let result = await readMessage(reader, remaining);
+  if (result.msg.type !== 'PublishOk') {
+    throw new Error('Expected PublishOk, got ' + result.msg.type);
+  }
+  console.log('PublishOk received for ' + result.msg.namespace + '/' + result.msg.name);
+
+  // Publish (audio) → PublishOk (テストパターンモードではスキップ)
+  if (!useTestPattern) {
+    await writer.write(encodePublish('live', 'audio'));
+    let audioResult = await readMessage(reader, result.remaining);
+    if (audioResult.msg.type !== 'PublishOk') {
+      throw new Error('Expected PublishOk for audio, got ' + audioResult.msg.type);
+    }
+    console.log('PublishOk received for ' + audioResult.msg.namespace + '/' + audioResult.msg.name);
+  }
+}
+
+function initVideoEncoder() {
+  encoder = new VideoEncoder({
+    output: async (chunk, metadata) => {
+      try {
+        const buf = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(buf);
+        const isKey = chunk.type === 'key';
+        if (isKey) {
+          groupId++;
+          objectIdInGroup = 0;
+        }
+        const header = encodeSubgroupStream(0, groupId, objectIdInGroup, buf.length);
+        objectIdInGroup++;
+
+        const uni = await transport.createUnidirectionalStream();
+        const w = uni.getWriter();
+        await w.write(concatBytes([header, buf]));
+        await w.close();
+
+        frameCount++;
+        const elapsed = (performance.now() - fpsStartTime) / 1000;
+        const fps = elapsed > 0 ? (frameCount / elapsed).toFixed(1) : '0';
+        statsEl.textContent = `Frames: ${frameCount} | FPS: ${fps} | Size: ${buf.length} bytes | ${isKey ? 'KEY' : 'delta'}`;
+        if (elapsed > 5) {
+          frameCount = 0;
+          fpsStartTime = performance.now();
+        }
+      } catch (e) {
+        console.error('send error:', e);
+        stopPublishing();
+        setStatus('Send error: ' + e.message, 'error');
+      }
+    },
+    error: (e) => {
+      console.error('encoder error:', e);
+      stopPublishing();
+      setStatus('Encoder error: ' + e.message, 'error');
+    }
+  });
+  encoder.configure({
+    codec: 'avc1.42001f',
+    width: 640,
+    height: 480,
+    bitrate: 1_000_000,
+    framerate: 15,
+    avc: { format: 'annexb' },
+  });
+}
+
+function initAudioEncoder() {
+  audioObjectId = 0;
+  audioEncoder = new AudioEncoder({
+    output: async (chunk) => {
+      try {
+        const buf = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(buf);
+        const header = encodeSubgroupStream(1, 0, audioObjectId, buf.length);
+        audioObjectId++;
+
+        const uni = await transport.createUnidirectionalStream();
+        const w = uni.getWriter();
+        await w.write(concatBytes([header, buf]));
+        await w.close();
+      } catch (e) {
+        console.error('audio send error:', e);
+      }
+    },
+    error: (e) => {
+      console.error('audio encoder error:', e);
+    }
+  });
+  audioEncoder.configure({
+    codec: 'opus',
+    sampleRate: 48000,
+    numberOfChannels: 1,
+    bitrate: 64000,
+  });
+
+  const audioTrack = preview.srcObject.getAudioTracks()[0];
+  if (audioTrack) {
+    const audioProcessor = new MediaStreamTrackProcessor({ track: audioTrack });
+    audioProcessorReader = audioProcessor.readable.getReader();
+    (async () => {
+      while (publishing) {
+        const { done, value: audioData } = await audioProcessorReader.read();
+        if (done) break;
+        if (audioEncoder && audioEncoder.state !== 'closed') {
+          audioEncoder.encode(audioData);
+        }
+        audioData.close();
+      }
+    })();
+  }
+}
+
 async function startPublishing() {
   startBtn.disabled = true;
   try {
-    setStatus('Connecting to WebTransport...');
-    transport = new WebTransport('https://' + HOST_IP + ':4433', {
-      serverCertificateHashes: [{
-        algorithm: 'sha-256',
-        value: CERT_HASH.buffer,
-      }],
-    });
-    await transport.ready;
-    setStatus('Connected! Setting up...', 'connected');
-
-    // 制御ストリーム (bidirectional)
-    const bidi = await transport.createBidirectionalStream();
-    const writer = bidi.writable.getWriter();
-    const reader = bidi.readable.getReader();
-
-    // ClientSetup 送信 → ServerSetup 受信
-    await writer.write(encodeClientSetup());
-    let { msg: serverSetup, remaining } = await readMessage(reader);
-    if (serverSetup.type !== 'ServerSetup') {
-      throw new Error('Expected ServerSetup, got ' + serverSetup.type);
-    }
-    console.log('ServerSetup received');
-
-    // Publish (video) 送信 → PublishOk 受信
-    await writer.write(encodePublish('live', 'video'));
-    let result = await readMessage(reader, remaining);
-    if (result.msg.type !== 'PublishOk') {
-      throw new Error('Expected PublishOk, got ' + result.msg.type);
-    }
-    console.log('PublishOk received for ' + result.msg.namespace + '/' + result.msg.name);
-
-    // Publish (audio) 送信 → PublishOk 受信 (テストパターンモードではスキップ)
-    if (!useTestPattern) {
-      await writer.write(encodePublish('live', 'audio'));
-      let audioResult = await readMessage(reader, result.remaining);
-      result.remaining = audioResult.remaining;
-      if (audioResult.msg.type !== 'PublishOk') {
-        throw new Error('Expected PublishOk for audio, got ' + audioResult.msg.type);
-      }
-      console.log('PublishOk received for ' + audioResult.msg.namespace + '/' + audioResult.msg.name);
-    }
-
-    // H.264 VideoEncoder 初期化
-    encoder = new VideoEncoder({
-      output: async (chunk, metadata) => {
-        try {
-          const buf = new Uint8Array(chunk.byteLength);
-          chunk.copyTo(buf);
-          const isKey = chunk.type === 'key';
-          if (isKey) {
-            groupId++;
-            objectIdInGroup = 0;
-          }
-          const header = encodeSubgroupStream(0, groupId, objectIdInGroup, buf.length); // trackAlias=0 (video)
-          objectIdInGroup++;
-
-          const uni = await transport.createUnidirectionalStream();
-          const w = uni.getWriter();
-          await w.write(concatBytes([header, buf]));
-          await w.close();
-
-          frameCount++;
-          const elapsed = (performance.now() - fpsStartTime) / 1000;
-          const fps = elapsed > 0 ? (frameCount / elapsed).toFixed(1) : '0';
-          statsEl.textContent = `Frames: ${frameCount} | FPS: ${fps} | Size: ${buf.length} bytes | ${isKey ? 'KEY' : 'delta'}`;
-          if (elapsed > 5) {
-            frameCount = 0;
-            fpsStartTime = performance.now();
-          }
-        } catch (e) {
-          console.error('send error:', e);
-          stopPublishing();
-          setStatus('Send error: ' + e.message, 'error');
-        }
-      },
-      error: (e) => {
-        console.error('encoder error:', e);
-        stopPublishing();
-        setStatus('Encoder error: ' + e.message, 'error');
-      }
-    });
-    encoder.configure({
-      codec: 'avc1.42001f',
-      width: 640,
-      height: 480,
-      bitrate: 1_000_000,
-      framerate: 15,
-      avc: { format: 'annexb' },
-    });
-
+    await setupConnection();
+    initVideoEncoder();
     publishing = true;
-
-    // AudioEncoder 初期化 + 音声処理ループ (テストパターンモードではスキップ)
     if (!useTestPattern) {
-      audioObjectId = 0;
-      audioEncoder = new AudioEncoder({
-        output: async (chunk) => {
-          try {
-            const buf = new Uint8Array(chunk.byteLength);
-            chunk.copyTo(buf);
-            const header = encodeSubgroupStream(1, 0, audioObjectId, buf.length); // trackAlias=1 (audio)
-            audioObjectId++;
-
-            const uni = await transport.createUnidirectionalStream();
-            const w = uni.getWriter();
-            await w.write(concatBytes([header, buf]));
-            await w.close();
-          } catch (e) {
-            console.error('audio send error:', e);
-          }
-        },
-        error: (e) => {
-          console.error('audio encoder error:', e);
-        }
-      });
-      audioEncoder.configure({
-        codec: 'opus',
-        sampleRate: 48000,
-        numberOfChannels: 1,
-        bitrate: 64000,
-      });
-
-      // MediaStreamTrackProcessor で音声トラック → AudioData → encode
-      const audioTrack = preview.srcObject.getAudioTracks()[0];
-      if (audioTrack) {
-        const audioProcessor = new MediaStreamTrackProcessor({ track: audioTrack });
-        audioProcessorReader = audioProcessor.readable.getReader();
-        (async () => {
-          while (publishing) {
-            const { done, value: audioData } = await audioProcessorReader.read();
-            if (done) break;
-            if (audioEncoder && audioEncoder.state !== 'closed') {
-              audioEncoder.encode(audioData);
-            }
-            audioData.close();
-          }
-        })();
-      }
+      initAudioEncoder();
     }
 
     totalFramesSent = 0;
@@ -314,7 +283,6 @@ async function startPublishing() {
     stopBtn.disabled = false;
     setStatus('Publishing...', 'connected');
 
-    // フレーム送信ループ (15 FPS)
     intervalId = setInterval(() => sendFrame(), 67);
   } catch (e) {
     console.error(e);

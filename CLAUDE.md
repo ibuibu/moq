@@ -24,7 +24,6 @@ cargo build --bin moq-client
 
 - `src/varint.rs` — QUIC 可変長整数 (RFC 9000 Section 16)
 - `src/message.rs` — MoQ プロトコルメッセージの encode/decode
-- `src/error.rs` — エラー型定義
 - `src/session.rs` — SETUP ハンドシェイクとメッセージ送受信ヘルパー
 - `src/publisher.rs` — Publisher (Object 送信ロジック)
 - `src/subscriber.rs` — Subscriber (Object 受信ロジック)

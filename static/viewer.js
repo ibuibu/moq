@@ -18,58 +18,22 @@ function encodeSubscribe(namespace, name) {
 }
 
 function decodeMessage(buf) {
-  let offset = 0;
-  const { value: msgType, bytesRead: b1 } = decodeVarInt(buf, offset);
-  offset += b1;
+  const base = decodeMessageBase(buf);
+  if (base.type) return base;
 
-  // Length framing: u16 big-endian
-  if (offset + 2 > buf.length) throw new Error('not enough data for message length');
-  const length = new DataView(buf.buffer, buf.byteOffset + offset).getUint16(0);
-  offset += 2;
-  if (offset + length > buf.length) throw new Error('not enough data for message payload');
-  const payloadStart = offset;
-
-  if (msgType === 0x21) { // SERVER_SETUP (draft-15)
-    // パラメータ解析
-    const { value: numParams, bytesRead: b2 } = decodeVarInt(buf, offset);
-    offset += b2;
-    for (let i = 0; i < numParams; i++) {
-      const { value: key, bytesRead: kb } = decodeVarInt(buf, offset);
-      offset += kb;
-      const { value: valLen, bytesRead: vlb } = decodeVarInt(buf, offset);
-      offset += vlb;
-      offset += valLen; // skip value
-    }
-    return { type: 'ServerSetup', totalBytes: payloadStart + length };
-  }
-
-  if (msgType === 0x04) { // SUBSCRIBE_OK
+  // viewer 固有: SUBSCRIBE_OK (0x04)
+  let offset = base.offset;
+  if (base.msgType === 0x04) {
     const { value: subscribeId, bytesRead: b2 } = decodeVarInt(buf, offset);
     offset += b2;
     const { value: expires, bytesRead: b3 } = decodeVarInt(buf, offset);
     offset += b3;
     const groupOrder = buf[offset]; offset += 1;
     const contentExists = buf[offset]; offset += 1;
-    return { type: 'SubscribeOk', subscribeId, expires, groupOrder, contentExists, totalBytes: payloadStart + length };
+    return { type: 'SubscribeOk', subscribeId, expires, groupOrder, contentExists, totalBytes: base.totalBytes };
   }
 
-  if (msgType === 0x05) { // REQUEST_ERROR
-    const { value: subscribeId, bytesRead: b2 } = decodeVarInt(buf, offset);
-    offset += b2;
-    const { value: errorCode, bytesRead: b3 } = decodeVarInt(buf, offset);
-    offset += b3;
-    const { value: reasonPhrase, bytesRead: b4 } = decodeString(buf, offset);
-    offset += b4;
-    return { type: 'RequestError', subscribeId, errorCode, reasonPhrase, totalBytes: payloadStart + length };
-  }
-
-  if (msgType === 0x10) { // GOAWAY
-    const { value: newSessionUri, bytesRead: b2 } = decodeString(buf, offset);
-    offset += b2;
-    return { type: 'GoAway', newSessionUri, totalBytes: payloadStart + length };
-  }
-
-  throw new Error('unknown message type: 0x' + msgType.toString(16));
+  throw new Error('unknown message type: 0x' + base.msgType.toString(16));
 }
 
 // --- SubgroupHeader + Object entry decode ---
@@ -129,127 +93,127 @@ async function readStream(reader) {
   return result;
 }
 
+async function setupConnection() {
+  setStatus('Connecting to WebTransport...');
+  const transport = new WebTransport('https://' + HOST_IP + ':4433', {
+    serverCertificateHashes: [{
+      algorithm: 'sha-256',
+      value: CERT_HASH.buffer,
+    }],
+  });
+  await transport.ready;
+  setStatus('Connected! Setting up...', 'connected');
+
+  const bidi = await transport.createBidirectionalStream();
+  const writer = bidi.writable.getWriter();
+  const reader = bidi.readable.getReader();
+
+  await writer.write(encodeClientSetup());
+  let { msg: serverSetup, remaining } = await readMessage(reader);
+  if (serverSetup.type !== 'ServerSetup') {
+    throw new Error('Expected ServerSetup, got ' + serverSetup.type);
+  }
+  console.log('ServerSetup received');
+
+  // Subscribe (video)
+  await writer.write(encodeSubscribe('live', 'video'));
+  let result = await readMessage(reader, remaining);
+  if (result.msg.type !== 'SubscribeOk') {
+    throw new Error('Expected SubscribeOk, got ' + result.msg.type);
+  }
+  console.log('SubscribeOk received subscribe_id=' + result.msg.subscribeId);
+
+  // Subscribe (audio)
+  await writer.write(encodeSubscribe('live', 'audio'));
+  let audioResult = await readMessage(reader, result.remaining);
+  if (audioResult.msg.type !== 'SubscribeOk') {
+    throw new Error('Expected SubscribeOk for audio, got ' + audioResult.msg.type);
+  }
+  console.log('SubscribeOk received subscribe_id=' + audioResult.msg.subscribeId);
+  setStatus('Receiving video + audio...', 'connected');
+
+  return transport;
+}
+
+function initVideoDecoder(frameCanvas) {
+  const frameCtx = frameCanvas.getContext('2d');
+  decoder = new VideoDecoder({
+    output: (frame) => {
+      frameCtx.drawImage(frame, 0, 0);
+      frame.close();
+    },
+    error: (e) => {
+      console.error('decoder error:', e);
+      setStatus('Decoder error: ' + e.message, 'error');
+    }
+  });
+  decoder.configure({
+    codec: 'avc1.42001f',
+  });
+  receivedKeyFrame = false;
+}
+
+function initAudioDecoder() {
+  audioContext = new AudioContext({ sampleRate: 48000 });
+  nextAudioTime = 0;
+
+  const unmuteBtn = document.getElementById('unmuteBtn');
+  if (audioContext.state === 'suspended') {
+    unmuteBtn.style.display = 'inline-block';
+    unmuteBtn.addEventListener('click', () => {
+      audioContext.resume();
+      unmuteBtn.style.display = 'none';
+    });
+  }
+  document.addEventListener('click', () => {
+    if (audioContext && audioContext.state === 'suspended') {
+      audioContext.resume();
+      unmuteBtn.style.display = 'none';
+    }
+  }, { once: true });
+
+  audioDecoder = new AudioDecoder({
+    output: (audioData) => {
+      const numFrames = audioData.numberOfFrames;
+      const sampleRate = audioData.sampleRate;
+      const buffer = audioContext.createBuffer(1, numFrames, sampleRate);
+      const channelData = new Float32Array(numFrames);
+      audioData.copyTo(channelData, { planeIndex: 0, format: 'f32-planar' });
+      buffer.copyToChannel(channelData, 0);
+      audioData.close();
+
+      const source = audioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioContext.destination);
+      const currentTime = audioContext.currentTime;
+      if (nextAudioTime < currentTime) {
+        nextAudioTime = currentTime;
+      }
+      source.start(nextAudioTime);
+      nextAudioTime += numFrames / sampleRate;
+    },
+    error: (e) => {
+      console.error('audio decoder error:', e);
+    }
+  });
+  audioDecoder.configure({
+    codec: 'opus',
+    sampleRate: 48000,
+    numberOfChannels: 1,
+  });
+}
+
 async function start() {
   try {
-    setStatus('Connecting to WebTransport...');
-    const transport = new WebTransport('https://' + HOST_IP + ':4433', {
-      serverCertificateHashes: [{
-        algorithm: 'sha-256',
-        value: CERT_HASH.buffer,
-      }],
-    });
-    await transport.ready;
-    setStatus('Connected! Setting up...', 'connected');
-
-    // 制御ストリーム (bidirectional)
-    const bidi = await transport.createBidirectionalStream();
-    const writer = bidi.writable.getWriter();
-    const reader = bidi.readable.getReader();
-
-    // ClientSetup 送信
-    await writer.write(encodeClientSetup());
-
-    // ServerSetup 受信
-    let { msg: serverSetup, remaining } = await readMessage(reader);
-    if (serverSetup.type !== 'ServerSetup') {
-      throw new Error('Expected ServerSetup, got ' + serverSetup.type);
-    }
-    console.log('ServerSetup received');
-
-    // Subscribe (video) 送信 → SubscribeOk 受信
-    await writer.write(encodeSubscribe('live', 'video'));
-    let result = await readMessage(reader, remaining);
-    if (result.msg.type !== 'SubscribeOk') {
-      throw new Error('Expected SubscribeOk, got ' + result.msg.type);
-    }
-    console.log('SubscribeOk received subscribe_id=' + result.msg.subscribeId);
-
-    // Subscribe (audio) 送信 → SubscribeOk 受信
-    await writer.write(encodeSubscribe('live', 'audio'));
-    let audioResult = await readMessage(reader, result.remaining);
-    if (audioResult.msg.type !== 'SubscribeOk') {
-      throw new Error('Expected SubscribeOk for audio, got ' + audioResult.msg.type);
-    }
-    console.log('SubscribeOk received subscribe_id=' + audioResult.msg.subscribeId);
-    setStatus('Receiving video + audio...', 'connected');
-
-    // H.264 VideoDecoder 初期化
-    const frameCanvas = document.getElementById('frame');
-    const frameCtx = frameCanvas.getContext('2d');
-    decoder = new VideoDecoder({
-      output: (frame) => {
-        frameCtx.drawImage(frame, 0, 0);
-        frame.close();
-      },
-      error: (e) => {
-        console.error('decoder error:', e);
-        setStatus('Decoder error: ' + e.message, 'error');
-      }
-    });
-    decoder.configure({
-      codec: 'avc1.42001f',
-    });
-    receivedKeyFrame = false;
-
-    // AudioDecoder + AudioContext 初期化
-    audioContext = new AudioContext({ sampleRate: 48000 });
-    nextAudioTime = 0;
-
-    // autoplay policy 対策: ボタンクリックで AudioContext を resume
-    const unmuteBtn = document.getElementById('unmuteBtn');
-    if (audioContext.state === 'suspended') {
-      unmuteBtn.style.display = 'inline-block';
-      unmuteBtn.addEventListener('click', () => {
-        audioContext.resume();
-        unmuteBtn.style.display = 'none';
-      });
-    }
-    // ページ上の任意のクリックでも resume
-    document.addEventListener('click', () => {
-      if (audioContext && audioContext.state === 'suspended') {
-        audioContext.resume();
-        unmuteBtn.style.display = 'none';
-      }
-    }, { once: true });
-
-    audioDecoder = new AudioDecoder({
-      output: (audioData) => {
-        // AudioData → AudioBuffer → AudioBufferSourceNode でギャップレス再生
-        const numFrames = audioData.numberOfFrames;
-        const sampleRate = audioData.sampleRate;
-        const buffer = audioContext.createBuffer(1, numFrames, sampleRate);
-        const channelData = new Float32Array(numFrames);
-        audioData.copyTo(channelData, { planeIndex: 0, format: 'f32-planar' });
-        buffer.copyToChannel(channelData, 0);
-        audioData.close();
-
-        const source = audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContext.destination);
-        const currentTime = audioContext.currentTime;
-        if (nextAudioTime < currentTime) {
-          nextAudioTime = currentTime;
-        }
-        source.start(nextAudioTime);
-        nextAudioTime += numFrames / sampleRate;
-      },
-      error: (e) => {
-        console.error('audio decoder error:', e);
-      }
-    });
-    audioDecoder.configure({
-      codec: 'opus',
-      sampleRate: 48000,
-      numberOfChannels: 1,
-    });
+    const transport = await setupConnection();
+    initVideoDecoder(document.getElementById('frame'));
+    initAudioDecoder();
 
     // オブジェクト受信ループ (unidirectional streams)
     const incomingReader = transport.incomingUnidirectionalStreams.getReader();
     while (true) {
       const { done, value: stream } = await incomingReader.read();
       if (done) break;
-
-      // 各ストリームを非同期で処理
       handleObjectStream(stream).catch(e => {
         console.warn('stream error:', e);
       });
