@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MoQ Video Publisher</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e; color: #eee; font-family: monospace;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 20px;
+  }
+  h1 { margin-bottom: 10px; color: #f0a; }
+  #status { margin-bottom: 10px; font-size: 14px; color: #aaa; }
+  #stats { margin-bottom: 10px; font-size: 13px; color: #888; }
+  video {
+    max-width: 90vw; max-height: 60vh;
+    border: 2px solid #333; background: #000;
+    margin-bottom: 10px;
+  }
+  button {
+    padding: 10px 30px; font-size: 16px; font-family: monospace;
+    background: #f0a; color: #1a1a2e; border: none; cursor: pointer;
+    margin: 5px;
+  }
+  button:disabled { background: #555; color: #888; cursor: not-allowed; }
+  .connected { color: #0f0 !important; }
+  .error { color: #f44 !important; }
+</style>
+</head>
+<body>
+<h1>MoQ Video Publisher</h1>
+<div id="status">Initializing...</div>
+<div id="stats"></div>
+<video id="preview" autoplay muted playsinline></video>
+<div>
+  <button id="startBtn" disabled>Start Publishing</button>
+  <button id="stopBtn" disabled>Stop</button>
+</div>
+<canvas id="canvas" style="display:none"></canvas>
+
+<script>
+let CERT_HASH, HOST_IP;
+</script>
+<script src="/common.js"></script>
+<script src="/publisher.js"></script>
+</body>
+</html>

@@ -58,11 +58,11 @@ async fn main() -> Result<()> {
         cert_hash.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
     );
 
-    // HTTP サーバー (HTML / JS 配信)
-    let viewer_html = generate_html(include_str!("../../static/viewer.html"), &cert_hash, &host_ip);
-    let publisher_html = generate_html(include_str!("../../static/publisher.html"), &cert_hash, &host_ip);
+    // HTTP サーバー (/config API)
+    let cert_hash_vec = cert_hash.to_vec();
+    let host_ip_clone = host_ip.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_http_server(viewer_html, publisher_html).await {
+        if let Err(e) = run_http_server(cert_hash_vec, host_ip_clone).await {
             tracing::error!("HTTP server error: {e}");
         }
     });
@@ -77,8 +77,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("MoQ server listening on :4433");
     tracing::info!("WebTransport host: {host_ip}");
-    tracing::info!("Viewer:    http://localhost:8080");
-    tracing::info!("Publisher: http://localhost:8080/publish");
+    tracing::info!("Config API: http://localhost:8080/config");
 
     loop {
         let incoming = server.accept().await;
@@ -92,14 +91,19 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_http_server(viewer_html: String, publisher_html: String) -> Result<()> {
+async fn run_http_server(cert_hash: Vec<u8>, host_ip: String) -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    tracing::info!("HTTP server listening on http://localhost:8080");
+    tracing::info!("HTTP server listening on http://localhost:8080 (/config)");
+
+    let config_json = format!(
+        r#"{{"certHash":[{}],"hostIp":"{}","port":4433}}"#,
+        cert_hash.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","),
+        host_ip,
+    );
 
     loop {
         let (mut stream, addr) = listener.accept().await?;
-        let viewer_html = viewer_html.clone();
-        let publisher_html = publisher_html.clone();
+        let config_json = config_json.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
             let n = match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
@@ -107,7 +111,6 @@ async fn run_http_server(viewer_html: String, publisher_html: String) -> Result<
                 Err(_) => return,
             };
 
-            // リクエスト行からパスを取得 (e.g. "GET /publish HTTP/1.1")
             let request = String::from_utf8_lossy(&buf[..n]);
             let path = request
                 .lines()
@@ -115,19 +118,21 @@ async fn run_http_server(viewer_html: String, publisher_html: String) -> Result<
                 .and_then(|line| line.split_whitespace().nth(1))
                 .unwrap_or("/");
 
-            let (content_type, body) = match path {
-                "/publish" => ("text/html; charset=utf-8", publisher_html.as_str()),
-                "/common.js" => ("application/javascript", include_str!("../../static/common.js")),
-                "/viewer.js" => ("application/javascript", include_str!("../../static/viewer.js")),
-                "/publisher.js" => ("application/javascript", include_str!("../../static/publisher.js")),
-                _ => ("text/html; charset=utf-8", viewer_html.as_str()),
+            let response = if path == "/config" {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    config_json.len(),
+                    config_json
+                )
+            } else {
+                let body = "404 Not Found";
+                format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
             };
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
             if let Err(e) = stream.write_all(response.as_bytes()).await {
                 tracing::warn!("HTTP write error for {addr}: {e}");
             }
@@ -154,17 +159,6 @@ fn detect_host_ip() -> String {
     "127.0.0.1".to_string()
 }
 
-fn generate_html(template: &str, cert_hash: &[u8; 32], host_ip: &str) -> String {
-    let hash_array = cert_hash
-        .iter()
-        .map(|b| format!("0x{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    template
-        .replace("__CERT_HASH__", &hash_array)
-        .replace("__HOST_IP__", host_ip)
-}
 
 async fn forward_track(
     connection: wtransport::Connection,

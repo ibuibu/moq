@@ -4,7 +4,7 @@ Media over QUIC Transport (MoQ) の最小限実装。WebTransport 上でリア�
 
 ## 概要
 
-- **moq-server** — WebTransport サーバー + HTTP 配信サーバー。Publisher からの映像/音声を受け取り、Subscriber に中継する
+- **moq-server** — WebTransport サーバー + `/config` API。Publisher からの映像/音声を受け取り、Subscriber に中継する
 - **moq-client** — CLI クライアント。テキスト/映像の publish/subscribe をサポート
 - **ブラウザクライアント** — WebTransport API を使ったブラウザベースの Publisher/Viewer
 
@@ -31,14 +31,16 @@ src/
   publisher.rs       # Publisher (Object 送信)
   subscriber.rs      # Subscriber (Object 受信)
   bin/
-    moq-server.rs    # サーバー (中継 + HTTP 配信)
+    moq-server.rs    # サーバー (中継 + /config API)
     moq-client.rs    # CLI クライアント (publish/subscribe/video-publish/video-subscribe)
-static/
-  viewer.html        # ブラウザ Viewer (H.264 + Opus デコード)
+frontend/
+  index.html         # ブラウザ Viewer (H.264 + Opus デコード)
   publisher.html     # ブラウザ Publisher (H.264 + Opus エンコード)
-  common.js          # 共有ユーティリティ (VarInt, String encode/decode, etc.)
+  common.js          # 共有ユーティリティ (VarInt, String encode/decode, fetchConfig, etc.)
   viewer.js          # Viewer 固有ロジック
   publisher.js       # Publisher 固有ロジック
+  package.json       # Vite 開発環境
+  vite.config.js     # Vite 設定 (/config プロキシ)
 ```
 
 ## セットアップ
@@ -72,16 +74,20 @@ cargo run --bin moq-server
 
 以下が起動する:
 - WebTransport サーバー: `:4433`
-- HTTP サーバー: `http://localhost:8080`
+- Config API: `http://localhost:8080/config`
 
 ### ブラウザクライアント
 
-サーバー起動後、Chrome でアクセス:
+サーバー起動後、Vite dev server を起動して Chrome でアクセス:
 
-- Viewer: http://localhost:8080
-- Publisher: http://localhost:8080/publish
+```bash
+cd frontend && npm install && npm run dev
+```
 
-自己署名証明書のハッシュと接続先 IP は HTML に自動埋め込みされる。
+- Viewer: http://localhost:5173
+- Publisher: http://localhost:5173/publisher.html
+
+自己署名証明書のハッシュと接続先 IP は `/config` API から自動取得される。
 
 ### CLI クライアント
 

@@ -268,6 +268,7 @@ function initAudioEncoder() {
 async function startPublishing() {
   startBtn.disabled = true;
   try {
+    await fetchConfig();
     await setupConnection();
     initVideoEncoder();
     publishing = true;

@@ -205,6 +205,7 @@ function initAudioDecoder() {
 
 async function start() {
   try {
+    await fetchConfig();
     const transport = await setupConnection();
     initVideoDecoder(document.getElementById('frame'));
     initAudioDecoder();

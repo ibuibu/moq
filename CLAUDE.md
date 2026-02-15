@@ -27,9 +27,9 @@ cargo build --bin moq-client
 - `src/session.rs` — SETUP ハンドシェイクとメッセージ送受信ヘルパー
 - `src/publisher.rs` — Publisher (Object 送信ロジック)
 - `src/subscriber.rs` — Subscriber (Object 受信ロジック)
-- `src/bin/moq-server.rs` — サーバー本体 (broadcast channel で中継 + HTTP 配信)
+- `src/bin/moq-server.rs` — サーバー本体 (broadcast channel で中継 + `/config` API)
 - `src/bin/moq-client.rs` — CLI クライアント (publish/subscribe/video-publish/video-subscribe)
-- `static/` — ブラウザクライアント用 HTML/JS
+- `frontend/` — ブラウザクライアント (Vite で開発・ビルド)
 
 ## 依存クレート
 
@@ -38,9 +38,19 @@ cargo build --bin moq-client
 - `bytes` — バッファ操作
 - `image` + `sdl2` — CLI video モードで使用
 
+## ブラウザクライアント開発
+
+```bash
+# Vite dev server 起動 (moq-server と併用)
+cd frontend && npm install && npm run dev
+```
+
+- Vite dev server: `http://localhost:5173` (Viewer) / `http://localhost:5173/publisher.html` (Publisher)
+- `/config` API は Vite のプロキシ経由で `http://localhost:8080/config` に転送される
+- ブラウザクライアントは Chrome 限定 (WebTransport + WebCodecs が必要)
+
 ## 開発上の注意点
 
 - wtransport の stream API: `open_bi().await?.await?` (2段階await)、`accept_bi().await?` (1段階)
-- `static/` の HTML は `include_str!` でバイナリに埋め込まれる。`__CERT_HASH__` と `__HOST_IP__` は実行時に動的置換される
-- JS ファイル (`common.js`, `viewer.js`, `publisher.js`) は置換不要でそのまま配信
-- ブラウザクライアントは Chrome 限定 (WebTransport + WebCodecs が必要)
+- moq-server は WebTransport + `/config` API のみ。HTML/JS の配信は行わない
+- ブラウザクライアントは `frontend/` ディレクトリで Vite を使って開発・ビルドする

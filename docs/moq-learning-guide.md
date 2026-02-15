@@ -186,7 +186,7 @@ pub fn decode(buf: &mut Bytes) -> anyhow::Result<Self> {
 }
 ```
 
-### JavaScript 実装 (`static/common.js:153-171`)
+### JavaScript 実装 (`frontend/common.js:153-171`)
 
 ブラウザ側では `readMessage()` がストリームからデータを逐次読み込み、メッセージが完成するまでバッファリングします:
 
@@ -725,27 +725,25 @@ async fn forward_track(
 
 | ファイル | 役割 |
 |---------|------|
-| `static/common.js` | VarInt, String, Tuple, ClientSetup のエンコード/デコード |
-| `static/publisher.js` | カメラ映像 + マイク音声 → WebCodecs → MoQ 送信 |
-| `static/viewer.js` | MoQ 受信 → WebCodecs → Canvas 描画 + 音声再生 |
+| `frontend/common.js` | VarInt, String, Tuple, ClientSetup のエンコード/デコード |
+| `frontend/publisher.js` | カメラ映像 + マイク音声 → WebCodecs → MoQ 送信 |
+| `frontend/viewer.js` | MoQ 受信 → WebCodecs → Canvas 描画 + 音声再生 |
 
-### HTML 配信の仕組み
+### 設定の取得
 
-サーバーの HTTP ハンドラ (`src/bin/moq-server.rs:95-136`) が HTML/JS を配信します:
+ブラウザクライアントは起動時に moq-server の `/config` API から接続情報を取得します:
 
-- HTML は `include_str!()` でバイナリに埋め込み
-- `__CERT_HASH__` と `__HOST_IP__` を実行時に動的置換
-- JS ファイルはそのまま配信 (置換不要)
-
-```rust
-let (content_type, body) = match path {
-    "/publish" => ("text/html; charset=utf-8", publisher_html.as_str()),
-    "/common.js" => ("application/javascript", include_str!("../../static/common.js")),
-    "/viewer.js" => ("application/javascript", include_str!("../../static/viewer.js")),
-    "/publisher.js" => ("application/javascript", include_str!("../../static/publisher.js")),
-    _ => ("text/html; charset=utf-8", viewer_html.as_str()),
-};
+```javascript
+// common.js の fetchConfig()
+async function fetchConfig() {
+  const res = await fetch('/config');
+  const config = await res.json();
+  CERT_HASH = new Uint8Array(config.certHash);
+  HOST_IP = config.hostIp;
+}
 ```
+
+開発時は Vite dev server のプロキシ経由で `/config` → `http://localhost:8080/config` に転送されます。
 
 ### Publisher (ブラウザ): エンコード → 送信
 
@@ -968,9 +966,12 @@ Publisher            Server              Subscriber
 # サーバー起動
 cargo run --bin moq-server
 
+# ブラウザクライアント起動 (別ターミナル)
+cd frontend && npm install && npm run dev
+
 # ブラウザで開く
-# Viewer:    http://localhost:8080
-# Publisher: http://localhost:8080/publish
+# Viewer:    http://localhost:5173
+# Publisher: http://localhost:5173/publisher.html
 ```
 
 Chrome で Publisher ページを開いてカメラを許可し、"Start Publishing" をクリック。

@@ -1,3 +1,23 @@
+// --- Config fetch ---
+async function fetchConfig() {
+  try {
+    const res = await fetch('/config');
+    const config = await res.json();
+    CERT_HASH = new Uint8Array(config.certHash);
+    HOST_IP = config.hostIp;
+    console.log('Config loaded: host=' + HOST_IP);
+  } catch (e) {
+    console.warn('Failed to fetch /config, using fallback:', e.message);
+    HOST_IP = location.hostname || 'localhost';
+    const hashHex = prompt('Enter cert hash (hex, colon-separated):', '');
+    if (hashHex) {
+      CERT_HASH = new Uint8Array(hashHex.split(':').map(h => parseInt(h, 16)));
+    } else {
+      CERT_HASH = new Uint8Array(32);
+    }
+  }
+}
+
 // --- VarInt (RFC 9000 Section 16) ---
 function encodeVarInt(value) {
   if (value < 0x40) {
