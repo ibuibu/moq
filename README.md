@@ -147,6 +147,42 @@ http://localhost:5173/publisher.html
 http://localhost:5173/?port=8081
 ```
 
+## Redis のデータ構造
+
+Redis Pub/Sub のみを使用し、永続化データは持たない (Redis が落ちても再起動すれば復帰する)。
+
+### チャネル名
+
+```
+moq:track:{namespace}:{track_name}
+```
+
+例:
+- `moq:track:live:video` — 映像トラック
+- `moq:track:live:audio` — 音声トラック
+
+### メッセージ形式
+
+各チャネルに publish されるメッセージは `RelayObject` を MessagePack でシリアライズしたバイナリ:
+
+| フィールド           | 型      | 説明                              |
+|---------------------|---------|-----------------------------------|
+| `group_id`          | `u64`   | グループ ID (映像のキーフレーム単位) |
+| `object_id`         | `u64`   | グループ内のオブジェクト ID          |
+| `subgroup_id`       | `u64`   | サブグループ ID                     |
+| `publisher_priority`| `u8`    | Publisher の優先度                  |
+| `payload`           | `bytes` | エンコード済みフレームデータ         |
+
+### Redis CLI での確認方法
+
+```bash
+# チャネルのメッセージを購読 (デバッグ用)
+redis-cli SUBSCRIBE moq:track:live:video
+
+# アクティブなチャネル一覧
+redis-cli PUBSUB CHANNELS "moq:track:*"
+```
+
 ## 技術詳細
 
 - **トランスポート**: [wtransport](https://crates.io/crates/wtransport) v0.7 (WebTransport over HTTP/3)
