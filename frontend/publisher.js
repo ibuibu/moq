@@ -130,7 +130,7 @@ async function initCamera() {
 
 async function setupConnection() {
   setStatus('Connecting to WebTransport...');
-  transport = new WebTransport('https://' + HOST_IP + ':4433', {
+  transport = new WebTransport('https://' + HOST_IP + ':' + QUIC_PORT, {
     serverCertificateHashes: [{
       algorithm: 'sha-256',
       value: CERT_HASH.buffer,

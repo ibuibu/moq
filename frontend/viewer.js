@@ -95,7 +95,7 @@ async function readStream(reader) {
 
 async function setupConnection() {
   setStatus('Connecting to WebTransport...');
-  const transport = new WebTransport('https://' + HOST_IP + ':4433', {
+  const transport = new WebTransport('https://' + HOST_IP + ':' + QUIC_PORT, {
     serverCertificateHashes: [{
       algorithm: 'sha-256',
       value: CERT_HASH.buffer,

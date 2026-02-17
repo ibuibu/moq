@@ -1,11 +1,15 @@
 // --- Config fetch ---
 async function fetchConfig() {
   try {
-    const res = await fetch('/config');
+    const port = new URLSearchParams(location.search).get('port');
+    const configUrl = port ? `http://localhost:${port}/config` : '/config';
+    const res = await fetch(configUrl);
     const config = await res.json();
+    console.log('Config URL:', configUrl);
     CERT_HASH = new Uint8Array(config.certHash);
     HOST_IP = config.hostIp;
-    console.log('Config loaded: host=' + HOST_IP);
+    QUIC_PORT = config.port || 4433;
+    console.log('Config loaded: host=' + HOST_IP + ' quic_port=' + QUIC_PORT);
   } catch (e) {
     console.warn('Failed to fetch /config, using fallback:', e.message);
     HOST_IP = location.hostname || 'localhost';

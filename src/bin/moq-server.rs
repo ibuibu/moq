@@ -1,11 +1,10 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::BytesMut;
+use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use wtransport::Endpoint;
 use wtransport::Identity;
@@ -15,21 +14,24 @@ use moq::message::{Message, PublishOk, SubgroupHeader, SubscribeOk, TrackNamespa
 use moq::session::{read_entire_stream, recv_message, send_message, server_setup};
 use moq::varint::VarInt;
 
-/// 中継用オブジェクト
-#[derive(Debug, Clone)]
+/// 中継用オブジェクト (Redis Pub/Sub 経由で MessagePack シリアライズ)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RelayObject {
     group_id: u64,
     object_id: u64,
     subgroup_id: u64,
     publisher_priority: u8,
+    #[serde(with = "serde_bytes")]
     payload: Vec<u8>,
 }
 
-/// Track ごとの broadcast チャネル
-type TrackKey = (TrackNamespace, String); // (namespace, name)
-type TrackChannels = Arc<Mutex<HashMap<TrackKey, broadcast::Sender<RelayObject>>>>;
+/// Track の namespace + name から Redis チャネル名を生成
+fn track_channel_name(namespace: &[String], track_name: &str) -> String {
+    format!("moq:track:{}:{}", namespace.join("/"), track_name)
+}
 
-const BROADCAST_CAPACITY: usize = 512;
+/// Track のキー (publisher_tracks のマッピング用)
+type TrackKey = (TrackNamespace, String); // (namespace, name)
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,47 +60,65 @@ async fn main() -> Result<()> {
         cert_hash.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
     );
 
+    // ポート設定 (環境変数で上書き可能)
+    let quic_port: u16 = std::env::var("QUIC_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4433);
+    let http_port: u16 = std::env::var("HTTP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8080);
+
     // HTTP サーバー (/config API)
     let cert_hash_vec = cert_hash.to_vec();
     let host_ip_clone = host_ip.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_http_server(cert_hash_vec, host_ip_clone).await {
+        if let Err(e) = run_http_server(cert_hash_vec, host_ip_clone, quic_port, http_port).await {
             tracing::error!("HTTP server error: {e}");
         }
     });
 
     let config = ServerConfig::builder()
-        .with_bind_default(4433)
+        .with_bind_default(quic_port)
         .with_identity(identity)
         .build();
 
     let server = Endpoint::server(config)?;
-    let tracks: TrackChannels = Arc::new(Mutex::new(HashMap::new()));
 
-    tracing::info!("MoQ server listening on :4433");
+    // Redis 接続
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    let redis_client = redis::Client::open(redis_url.as_str())?;
+    // 起動時に接続確認
+    let mut conn = redis_client.get_multiplexed_async_connection().await?;
+    redis::cmd("PING").query_async::<String>(&mut conn).await?;
+    tracing::info!("connected to Redis at {redis_url}");
+
+    tracing::info!("MoQ server listening on :{quic_port}");
     tracing::info!("WebTransport host: {host_ip}");
-    tracing::info!("Config API: http://localhost:8080/config");
+    tracing::info!("Config API: http://localhost:{http_port}/config");
 
     loop {
         let incoming = server.accept().await;
-        let tracks = tracks.clone();
+        let redis_client = redis_client.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_session(incoming, tracks).await {
+            if let Err(e) = handle_session(incoming, redis_client).await {
                 tracing::error!("session error: {e}");
             }
         });
     }
 }
 
-async fn run_http_server(cert_hash: Vec<u8>, host_ip: String) -> Result<()> {
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    tracing::info!("HTTP server listening on http://localhost:8080 (/config)");
+async fn run_http_server(cert_hash: Vec<u8>, host_ip: String, quic_port: u16, http_port: u16) -> Result<()> {
+    let listener = TcpListener::bind(format!("0.0.0.0:{http_port}")).await?;
+    tracing::info!("HTTP server listening on http://localhost:{http_port} (/config)");
 
     let config_json = format!(
-        r#"{{"certHash":[{}],"hostIp":"{}","port":4433}}"#,
+        r#"{{"certHash":[{}],"hostIp":"{}","port":{}}}"#,
         cert_hash.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","),
         host_ip,
+        quic_port,
     );
 
     loop {
@@ -160,20 +180,38 @@ fn detect_host_ip() -> String {
 }
 
 
-async fn forward_track(
+async fn forward_track_redis(
     connection: wtransport::Connection,
     subscribe_id: u64,
     track_alias: u64,
-    mut rx: broadcast::Receiver<RelayObject>,
+    redis_client: redis::Client,
+    channel_name: String,
 ) {
-    loop {
-        let obj = match rx.recv().await {
-            Ok(v) => v,
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("subscriber lagged, skipped {n} messages");
+    let mut pubsub = match redis_client.get_async_pubsub().await {
+        Ok(ps) => ps,
+        Err(e) => {
+            tracing::error!("failed to create Redis PubSub connection: {e}");
+            return;
+        }
+    };
+    if let Err(e) = pubsub.subscribe(&channel_name).await {
+        tracing::error!("failed to subscribe to {channel_name}: {e}");
+        return;
+    }
+    tracing::info!("Redis subscribed to {channel_name}");
+
+    let mut stream = pubsub.on_message();
+    while let Some(msg) = stream.next().await {
+        let data: Vec<u8> = match msg.get_payload() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let obj: RelayObject = match rmp_serde::from_slice(&data) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!("failed to deserialize RelayObject: {e}");
                 continue;
             }
-            Err(broadcast::error::RecvError::Closed) => break,
         };
 
         let mut send = match connection.open_uni().await {
@@ -209,7 +247,7 @@ async fn forward_track(
 
 async fn handle_session(
     incoming: wtransport::endpoint::IncomingSession,
-    tracks: TrackChannels,
+    redis_client: redis::Client,
 ) -> Result<()> {
     let session_request = incoming.await?;
     tracing::info!("new session from {}", session_request.remote_address());
@@ -221,10 +259,10 @@ async fn handle_session(
     let msg = recv_message(&mut control_recv).await?;
     match msg {
         Message::Publish(p) => {
-            handle_publisher(connection, control_send, control_recv, p, tracks).await
+            handle_publisher(connection, control_send, control_recv, p, redis_client).await
         }
         Message::Subscribe(s) => {
-            handle_subscriber(connection, control_send, control_recv, s, tracks).await
+            handle_subscriber(connection, control_send, control_recv, s, redis_client).await
         }
         other => {
             anyhow::bail!("expected Publish or Subscribe, got {:?}", other);
@@ -237,7 +275,7 @@ async fn handle_publisher(
     mut control_send: wtransport::stream::SendStream,
     mut control_recv: wtransport::stream::RecvStream,
     p: moq::message::Publish,
-    tracks: TrackChannels,
+    redis_client: redis::Client,
 ) -> Result<()> {
     tracing::info!("publisher for {:?}/{}", p.track_namespace, p.track_name);
 
@@ -250,18 +288,9 @@ async fn handle_publisher(
 
     // publisher_tracks: track_alias (= index) → TrackKey マッピング
     let mut publisher_tracks: Vec<TrackKey> = Vec::new();
-    let first_key = (p.track_namespace.clone(), p.track_name.clone());
-
-    // 最初のトラックの broadcast チャネルを作成
-    {
-        let mut map = tracks.lock().await;
-        map.entry(first_key.clone())
-            .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0);
-    }
-    publisher_tracks.push(first_key);
+    publisher_tracks.push((p.track_namespace.clone(), p.track_name.clone()));
 
     // 制御ストリームをバックグラウンドで読み続け、追加 Publish に対応
-    let tracks_ctrl = tracks.clone();
     let publisher_tracks_shared = Arc::new(Mutex::new(publisher_tracks));
     let publisher_tracks_ctrl = publisher_tracks_shared.clone();
     tokio::spawn(async move {
@@ -277,11 +306,6 @@ async fn handle_publisher(
                         break;
                     }
                     let key = (p2.track_namespace.clone(), p2.track_name.clone());
-                    {
-                        let mut map = tracks_ctrl.lock().await;
-                        map.entry(key.clone())
-                            .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0);
-                    }
                     publisher_tracks_ctrl.lock().await.push(key);
                 }
                 Ok(Message::GoAway(g)) => {
@@ -295,7 +319,10 @@ async fn handle_publisher(
         }
     });
 
-    // Publisher からの unidirectional stream を受け取って broadcast
+    // Redis 接続 (publish 用)
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+
+    // Publisher からの unidirectional stream を受け取って Redis に publish
     loop {
         let mut recv = match connection.accept_uni().await {
             Ok(r) => r,
@@ -331,19 +358,20 @@ async fn handle_publisher(
             payload.len()
         );
 
-        let tx = {
-            let mut map = tracks.lock().await;
-            map.entry(key)
-                .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
-                .clone()
-        };
-        let _ = tx.send(RelayObject {
+        let channel = track_channel_name(&key.0, &key.1);
+        let obj = RelayObject {
             group_id: header.group_id,
             object_id,
             subgroup_id: header.subgroup_id,
             publisher_priority: header.publisher_priority,
             payload,
-        });
+        };
+        let serialized = rmp_serde::to_vec(&obj)?;
+        redis::cmd("PUBLISH")
+            .arg(&channel)
+            .arg(serialized)
+            .query_async::<()>(&mut redis_conn)
+            .await?;
     }
 
     Ok(())
@@ -354,7 +382,7 @@ async fn handle_subscriber(
     mut control_send: wtransport::stream::SendStream,
     mut control_recv: wtransport::stream::RecvStream,
     s: moq::message::Subscribe,
-    tracks: TrackChannels,
+    redis_client: redis::Client,
 ) -> Result<()> {
     tracing::info!("subscriber for {:?}/{}", s.track_namespace, s.track_name);
 
@@ -367,22 +395,16 @@ async fn handle_subscriber(
     });
     send_message(&mut control_send, &ok).await?;
 
-    // subscriber_tracks: TrackKey → (subscribe_id, track_alias)
-    let mut subscriber_tracks: HashMap<TrackKey, (u64, u64)> = HashMap::new();
-    let first_key = (s.track_namespace.clone(), s.track_name.clone());
-    subscriber_tracks.insert(first_key.clone(), (s.subscribe_id, s.track_alias));
-
     // 最初のトラック転送を spawn
-    let rx = {
-        let mut map = tracks.lock().await;
-        let tx = map
-            .entry(first_key)
-            .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
-            .clone();
-        tx.subscribe()
-    };
+    let channel_name = track_channel_name(&s.track_namespace, &s.track_name);
     let conn = connection.clone();
-    tokio::spawn(forward_track(conn, s.subscribe_id, s.track_alias, rx));
+    tokio::spawn(forward_track_redis(
+        conn,
+        s.subscribe_id,
+        s.track_alias,
+        redis_client.clone(),
+        channel_name,
+    ));
 
     // 制御ストリームを読み続け、追加 Subscribe に対応
     loop {
@@ -398,18 +420,15 @@ async fn handle_subscriber(
                 if send_message(&mut control_send, &ok).await.is_err() {
                     break;
                 }
-                let key = (s2.track_namespace.clone(), s2.track_name.clone());
-                subscriber_tracks.insert(key.clone(), (s2.subscribe_id, s2.track_alias));
-                let rx = {
-                    let mut map = tracks.lock().await;
-                    let tx = map
-                        .entry(key)
-                        .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
-                        .clone();
-                    tx.subscribe()
-                };
+                let channel_name = track_channel_name(&s2.track_namespace, &s2.track_name);
                 let conn = connection.clone();
-                tokio::spawn(forward_track(conn, s2.subscribe_id, s2.track_alias, rx));
+                tokio::spawn(forward_track_redis(
+                    conn,
+                    s2.subscribe_id,
+                    s2.track_alias,
+                    redis_client.clone(),
+                    channel_name,
+                ));
             }
             Ok(Message::Unsubscribe(u)) => {
                 tracing::info!("received Unsubscribe subscribe_id={}", u.subscribe_id);
